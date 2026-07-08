@@ -11,6 +11,9 @@ def safe_serialize(value: Any) -> Any:
     try:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        branchpoint_serialize = getattr(value, "__branchpoint_serialize__", None)
+        if callable(branchpoint_serialize):
+            return safe_serialize(branchpoint_serialize())
         if isinstance(value, bytes):
             return {"type": "bytes", "length": len(value)}
         if isinstance(value, datetime):

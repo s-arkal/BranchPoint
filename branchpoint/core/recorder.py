@@ -22,6 +22,7 @@ from .context import (
 from .errors import NoActiveTraceError
 from .event_store import EventStore
 from .ids import new_event_id, new_run_id, new_span_id
+from .provenance import ProvenanceTracker
 from .schema import ERROR, RUNNING, SUCCESS, TraceEvent, TraceRun, utc_now_iso
 from .serialization import safe_serialize
 from branchpoint.storage.blob_store import BlobStore
@@ -67,14 +68,23 @@ class TraceContext:
         finally:
             if self._tokens is not None:
                 reset_trace_context(self._tokens)
+            if self.recorder.provenance_tracker is not None:
+                self.recorder.provenance_tracker.clear()
         return False
 
 
 class Recorder:
-    def __init__(self, project_id: str, store: EventStore, blob_store: BlobStore) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        store: EventStore,
+        blob_store: BlobStore,
+        provenance_tracker: ProvenanceTracker | None = None,
+    ) -> None:
         self.project_id = project_id
         self.store = store
         self.blob_store = blob_store
+        self.provenance_tracker = provenance_tracker
 
     def trace(self, name: str | None = None, metadata: dict[str, Any] | None = None) -> TraceContext:
         return TraceContext(self, name=name, metadata=metadata)

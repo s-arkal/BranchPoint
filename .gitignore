@@ -5,4 +5,9 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Local planning artifacts
+plans/advanced-provenance-dependency-tracking.md
+plans/advanced-provenance-dependency-tracking/
+plan_archive/
 *.py[cod]
