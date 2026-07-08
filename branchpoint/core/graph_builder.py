@@ -28,12 +28,15 @@ from .graph_types import (
     deterministic_edge_id,
 )
 from .schema import (
+    FINAL_OUTPUT,
     HANDOFF,
+    LLM_CALL,
     LLM_OUTPUT,
     MEMORY_READ,
     MEMORY_WRITE,
     RETRIEVAL_RESULT,
     ROUTING_DECISION,
+    TOOL_CALL,
     TOOL_OUTPUT,
     VALIDATION_CHECK,
     TraceEvent,
@@ -85,9 +88,10 @@ class GraphBuilder:
         for event in ordered:
             for ref in event.input_refs:
                 source = by_id.get(ref)
-                edge_type = _dependency_type_for_source(source)
-                add(ref, event.event_id, edge_type, 0.95, "Event explicitly listed source event as input_ref")
-                add(ref, event.event_id, EXPLICIT_INPUT_REF, 0.95, "Event explicitly listed source event as input_ref")
+                edge_type = infer_dependency_edge_type(source, event)
+                metadata = _provenance_edge_metadata(event, ref)
+                add(ref, event.event_id, edge_type, 0.95, "Event explicitly listed source event as input_ref", metadata)
+                add(ref, event.event_id, EXPLICIT_INPUT_REF, 0.95, "Event explicitly listed source event as input_ref", metadata)
             for ref in event.output_refs:
                 add(event.event_id, ref, STATE_DEPENDENCY, 0.80, "Event explicitly listed target event as output_ref")
                 add(event.event_id, ref, EXPLICIT_OUTPUT_REF, 0.80, "Event explicitly listed target event as output_ref")
@@ -144,17 +148,70 @@ class GraphBuilder:
         return graph
 
 
-def _dependency_type_for_source(source: TraceEvent | None) -> str:
-    if source is None:
+def infer_dependency_edge_type(source_event: TraceEvent | None, target_event: TraceEvent | None) -> str:
+    if source_event is None or target_event is None:
         return STATE_DEPENDENCY
-    if source.type == TOOL_OUTPUT:
+    source_type = source_event.type
+    target_type = target_event.type
+
+    if source_type == TOOL_OUTPUT and target_type in {LLM_CALL, TOOL_CALL, FINAL_OUTPUT}:
         return TOOL_RESULT_DEPENDENCY
-    if source.type == RETRIEVAL_RESULT:
+    if source_type == RETRIEVAL_RESULT and target_type == LLM_CALL:
         return RETRIEVAL_DEPENDENCY
-    if source.type in {MEMORY_READ, MEMORY_WRITE}:
+    if source_type == MEMORY_WRITE and target_type in {MEMORY_READ, LLM_CALL}:
         return MEMORY_DEPENDENCY
-    if source.type == LLM_OUTPUT:
+    if source_type == MEMORY_READ and target_type == LLM_CALL:
+        return MEMORY_DEPENDENCY
+    if source_type == LLM_OUTPUT and target_type == MEMORY_WRITE:
+        return STATE_DEPENDENCY
+    if source_type == LLM_OUTPUT and target_type == FINAL_OUTPUT:
         return LLM_RESPONSE_DEPENDENCY
-    if source.type == VALIDATION_CHECK:
+    if source_type == VALIDATION_CHECK and target_type in {LLM_CALL, FINAL_OUTPUT}:
         return VALIDATION_DEPENDENCY
+    if source_type == ROUTING_DECISION and target_type in {HANDOFF, TOOL_CALL, LLM_CALL}:
+        return ROUTING_DEPENDENCY
+    if source_type == HANDOFF and target_type in {LLM_CALL, TOOL_CALL}:
+        return HANDOFF_DEPENDENCY
     return STATE_DEPENDENCY
+
+
+def _provenance_edge_metadata(target_event: TraceEvent, source_event_id: str) -> dict[str, Any]:
+    provenance = target_event.metadata.get("provenance")
+    if not isinstance(provenance, dict):
+        return {}
+    details = provenance.get("input_refs_detail")
+    if not isinstance(details, list):
+        return {}
+
+    matching_details = [
+        detail
+        for detail in details
+        if isinstance(detail, dict) and detail.get("event_id") == source_event_id
+    ]
+    if not matching_details:
+        return {}
+
+    metadata: dict[str, Any] = {"input_refs_detail": matching_details}
+    paths = _unique_metadata_values(detail.get("path", []) for detail in matching_details if "path" in detail)
+    reasons = _unique_metadata_values(detail.get("reason") for detail in matching_details if detail.get("reason") is not None)
+    confidences = _unique_metadata_values(
+        detail.get("confidence") for detail in matching_details if detail.get("confidence") is not None
+    )
+    if paths:
+        metadata["paths"] = paths
+    if reasons:
+        metadata["reasons"] = reasons
+    if confidences:
+        metadata["confidences"] = confidences
+    return metadata
+
+
+def _unique_metadata_values(values: Iterable[Any]) -> list[Any]:
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        marker = repr(value)
+        if marker not in seen:
+            unique.append(value)
+            seen.add(marker)
+    return unique

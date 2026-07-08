@@ -24,12 +24,18 @@ from .prompt import BranchPointPrompt
 
 
 class BranchPoint:
-    def __init__(self, project: str, db_path: str = ".branchpoint/branchpoint.sqlite") -> None:
+    def __init__(
+        self,
+        project: str,
+        db_path: str = ".branchpoint/branchpoint.sqlite",
+        *,
+        provenance_mode: str = "hybrid",
+    ) -> None:
         self.project_id = project
         self.db_path = db_path
         self.store = SQLiteEventStore(db_path=db_path)
         self.blob_store = BlobStore(Path(db_path).parent)
-        self.provenance_tracker = ProvenanceTracker()
+        self.provenance_tracker = ProvenanceTracker(provenance_mode=provenance_mode)
         self.recorder = Recorder(
             project_id=project,
             store=self.store,
@@ -87,12 +93,20 @@ class BranchPoint:
                 details[key] = ref
         return [details[key] for key in sorted(details)]
 
+    def unwrap(self, value: Any) -> Any:
+        return self.provenance_tracker.unwrap(value)
+
+    def detach(self, value: Any) -> Any:
+        return self.provenance_tracker.detach(value)
+
     def tool(
         self,
         name: str | None = None,
         *,
         exclude_args: list[int] | None = None,
         exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
         return tool_decorator(
@@ -101,6 +115,8 @@ class BranchPoint:
             name=name,
             exclude_args=exclude_args,
             exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
             metadata=metadata,
         )
 
@@ -110,6 +126,8 @@ class BranchPoint:
         *,
         exclude_args: list[int] | None = None,
         exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
         return llm_decorator(
@@ -118,6 +136,8 @@ class BranchPoint:
             name=name,
             exclude_args=exclude_args,
             exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
             metadata=metadata,
         )
 
@@ -127,6 +147,8 @@ class BranchPoint:
         *,
         exclude_args: list[int] | None = None,
         exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
         return memory_read_decorator(
@@ -135,6 +157,8 @@ class BranchPoint:
             name=name,
             exclude_args=exclude_args,
             exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
             metadata=metadata,
         )
 
@@ -144,6 +168,8 @@ class BranchPoint:
         *,
         exclude_args: list[int] | None = None,
         exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
         return memory_write_decorator(
@@ -152,6 +178,8 @@ class BranchPoint:
             name=name,
             exclude_args=exclude_args,
             exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
             metadata=metadata,
         )
 
@@ -161,6 +189,8 @@ class BranchPoint:
         *,
         exclude_args: list[int] | None = None,
         exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
     ):
         return retrieval_decorator(
@@ -169,6 +199,8 @@ class BranchPoint:
             name=name,
             exclude_args=exclude_args,
             exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
             metadata=metadata,
         )
 

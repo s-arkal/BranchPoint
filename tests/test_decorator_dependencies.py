@@ -270,6 +270,79 @@ def test_reserved_bp_no_track_kwarg(tmp_path):
     assert payment_output.event_id not in llm_call.input_refs
 
 
+def test_decorator_field_read_dependency(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("payment_lookup")
+    def payment_lookup():
+        return {"refund_eligible": True, "amount": 42}
+
+    @bp.llm("interpret")
+    def interpret(eligible):
+        return {"eligible": bool(eligible)}
+
+    with bp.trace("run") as trace:
+        payment = payment_lookup()
+        eligible = payment["refund_eligible"]
+        interpret(eligible)
+
+    events = bp.store.list_events(trace.run_id)
+    payment_output = _event(events, TOOL_OUTPUT, "payment_lookup")
+    llm_call = _event(events, LLM_CALL, "interpret")
+    detail = llm_call.metadata["provenance"]["input_refs_detail"][0]
+
+    assert payment_output.event_id in llm_call.input_refs
+    assert detail["event_id"] == payment_output.event_id
+    assert detail["path"] == ["refund_eligible"]
+
+
+def test_full_decorator_api_options(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("tracked_source")
+    def tracked_source():
+        return {"x": 1}
+
+    @bp.tool("untracked_source", track_output=False)
+    def untracked_source():
+        return {"x": 2}
+
+    @bp.tool("sidecar_source", provenance_mode="sidecar")
+    def sidecar_source():
+        return {"x": 3}
+
+    @bp.llm("summarize", exclude_kwargs=["ignored"], track_output=False, provenance_mode="off", metadata={"owner": "tests"})
+    def summarize(payload, *, ignored):
+        return {"text": str(payload["x"])}
+
+    with bp.trace("run") as trace:
+        tracked = tracked_source()
+        untracked = untracked_source()
+        sidecar = sidecar_source()
+        summary = summarize(tracked, ignored=sidecar)
+        refs_inside_trace = {
+            "tracked": bp.refs(tracked),
+            "untracked": bp.refs(untracked),
+            "sidecar": bp.refs(sidecar),
+            "summary": bp.refs(summary),
+        }
+
+    events = bp.store.list_events(trace.run_id)
+    tracked_output = _event(events, TOOL_OUTPUT, "tracked_source")
+    untracked_output = _event(events, TOOL_OUTPUT, "untracked_source")
+    sidecar_output = _event(events, TOOL_OUTPUT, "sidecar_source")
+    llm_call = _event(events, LLM_CALL, "summarize")
+
+    assert refs_inside_trace["tracked"] == [tracked_output.event_id]
+    assert refs_inside_trace["untracked"] == []
+    assert refs_inside_trace["sidecar"] == [sidecar_output.event_id]
+    assert refs_inside_trace["summary"] == []
+    assert tracked_output.event_id in llm_call.input_refs
+    assert untracked_output.event_id not in llm_call.input_refs
+    assert sidecar_output.event_id not in llm_call.input_refs
+    assert llm_call.metadata["owner"] == "tests"
+
+
 def test_tracker_state_clears_at_trace_end(tmp_path):
     bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
 

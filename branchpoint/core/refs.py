@@ -47,6 +47,23 @@ def ref_to_dict(ref: ProvenanceRef) -> dict[str, Any]:
     }
 
 
+def augment_ref_path(
+    ref: ProvenanceRef,
+    path: tuple[Any, ...],
+    *,
+    reason: str | None = None,
+) -> ProvenanceRef:
+    return ProvenanceRef(
+        event_id=ref.event_id,
+        path=(*ref.path, *path),
+        source_event_type=ref.source_event_type,
+        source_event_name=ref.source_event_name,
+        reason=reason or ref.reason,
+        confidence=ref.confidence,
+        metadata=ref.metadata,
+    )
+
+
 def refs_to_dicts(refs: list[ProvenanceRef] | set[ProvenanceRef]) -> list[dict[str, Any]]:
     return [ref_to_dict(ref) for ref in sorted(refs, key=_sort_key)]
 

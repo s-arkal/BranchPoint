@@ -5,18 +5,29 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass
 from typing import Any
 
+from .proxies import detach, unwrap, wrap_tracked
 from .refs import ProvenanceRef, normalize_input_refs, refs_to_dicts
 from .schema import TraceEvent
 
 
 class ProvenanceTracker:
-    def __init__(self) -> None:
+    VALID_MODES = {"off", "sidecar", "hybrid", "strict_proxy"}
+
+    def __init__(self, provenance_mode: str = "sidecar") -> None:
+        if provenance_mode not in self.VALID_MODES:
+            raise ValueError(f"Unsupported provenance_mode: {provenance_mode}")
+        self.provenance_mode = provenance_mode
+        self.generation = 0
         self._by_object_id: dict[int, set[ProvenanceRef]] = {}
         self._object_type_by_id: dict[int, str] = {}
 
     def clear(self) -> None:
+        self.generation += 1
         self._by_object_id.clear()
         self._object_type_by_id.clear()
+
+    def is_generation_active(self, generation: int | None) -> bool:
+        return generation is None or generation == self.generation
 
     def attach(
         self,
@@ -27,8 +38,12 @@ class ProvenanceTracker:
         reason: str = "return_value",
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
+        provenance_mode: str | None = None,
     ) -> Any:
-        if not _is_trackable(value):
+        mode = provenance_mode or self.provenance_mode
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Unsupported provenance_mode: {mode}")
+        if mode == "off":
             return value
         ref = _make_ref(
             event,
@@ -37,6 +52,12 @@ class ProvenanceTracker:
             confidence=confidence,
             metadata=metadata,
         )
+        if mode in {"hybrid", "strict_proxy"}:
+            proxied = wrap_tracked(value, [ref], self, path=path)
+            if proxied is not value:
+                return proxied
+        if not _is_trackable(value):
+            return value
         object_id = id(value)
         self._by_object_id.setdefault(object_id, set()).add(ref)
         self._object_type_by_id[object_id] = type(value).__name__
@@ -52,6 +73,12 @@ class ProvenanceTracker:
 
     def details(self, value: Any, recursive: bool = True) -> list[dict[str, Any]]:
         return refs_to_dicts(set(self.get_refs(value, recursive=recursive)))
+
+    def unwrap(self, value: Any) -> Any:
+        return unwrap(value)
+
+    def detach(self, value: Any) -> Any:
+        return detach(value)
 
     def _collect_refs(
         self,

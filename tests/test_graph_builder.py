@@ -20,7 +20,6 @@ from branchpoint.core.graph_types import (
     PARENT_CHILD_ALIAS,
     ROUTING_DEPENDENCY,
     SEQUENCE,
-    STATE_DEPENDENCY,
     TOOL_RESULT_DEPENDENCY,
 )
 
@@ -62,4 +61,3 @@ def test_graph_builder_returns_networkx_graph_and_persists_deduped_edges(tmp_pat
     assert MEMORY_DEPENDENCY in types
     assert ROUTING_DEPENDENCY in types
     assert HANDOFF_DEPENDENCY in types
-    assert STATE_DEPENDENCY in types

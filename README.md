@@ -30,6 +30,16 @@ with bp.trace("refund-workflow") as trace:
     bp.emit(type="userrequest", name="initial_request", output={"query": "hello"})
 ```
 
+## Advanced Provenance
+
+BranchPoint can preserve dependencies without an agent framework:
+
+- decorators attach provenance to tool, LLM, retrieval, and memory outputs
+- hybrid tracking preserves field reads such as `payment["refund_eligible"]`
+- `bp.prompt()`, `bp.format(...)`, and `bp.depends_on(...)` help keep refs through prompt construction
+- manual `emit(..., input_refs=...)` remains available for final outputs, labels, and custom events
+- the graph builder turns recorded `input_refs` into semantic dependency edges
+
 ## CLI
 
 ```bash
@@ -43,17 +53,19 @@ uv run python -m branchpoint graph <run_id>
 Run the frameworkless refund-agent demo:
 
 ```bash
+python examples/refund_agent/run_demo.py
+```
+
+Or, with the repository's `uv` environment:
+
+```bash
 uv run python examples/refund_agent/run_demo.py
 ```
 
-The demo records an intentionally failed refund workflow and writes a Mermaid
-graph viewer under `.branchpoint/graphs/`.
-
-To generate the graph files without opening a browser:
-
-```bash
-uv run python examples/refund_agent/run_demo.py --no-open
-```
+The demo records an intentionally failed refund workflow, then prints the run
+ID, events, provenance details, and graph edges. It demonstrates decorator
+provenance, field-level reads, prompt ref preservation, and manual final
+output/failure label emits.
 
 ## Tests
 

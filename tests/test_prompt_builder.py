@@ -54,6 +54,31 @@ def test_prompt_add_with_explicit_ref(tmp_path):
     assert bp.refs(bp.prompt().add("literal only")) == []
 
 
+def test_prompt_add_with_explicit_field_ref_keeps_path(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("payment_lookup")
+    def payment_lookup():
+        return {"refund_eligible": True}
+
+    @bp.llm("interpret")
+    def interpret(prompt):
+        return {"summary": str(prompt)}
+
+    with bp.trace("run") as trace:
+        payment = payment_lookup()
+        prompt = bp.prompt().add("Eligible: true", ref=payment["refund_eligible"])
+        interpret(prompt)
+
+    events = bp.store.list_events(trace.run_id)
+    payment_output = _event(events, TOOL_OUTPUT, "payment_lookup")
+    llm_call = _event(events, LLM_CALL, "interpret")
+    detail = llm_call.metadata["provenance"]["input_refs_detail"][0]
+
+    assert payment_output.event_id in llm_call.input_refs
+    assert detail["path"] == ["refund_eligible"]
+
+
 def test_bp_format_preserves_refs(tmp_path):
     bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
 

@@ -34,6 +34,8 @@ def tool_decorator(
     *,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     return _call_output_pair(
@@ -44,6 +46,8 @@ def tool_decorator(
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
         metadata=metadata,
     )
 
@@ -55,6 +59,8 @@ def llm_decorator(
     *,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     return _call_output_pair(
@@ -65,6 +71,8 @@ def llm_decorator(
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
         metadata=metadata,
         metadata_builder=_llm_metadata,
     )
@@ -77,6 +85,8 @@ def retrieval_decorator(
     *,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     return _call_output_pair(
@@ -87,6 +97,8 @@ def retrieval_decorator(
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
         metadata=metadata,
     )
 
@@ -98,6 +110,8 @@ def memory_read_decorator(
     *,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     return _memory_event(
@@ -108,6 +122,8 @@ def memory_read_decorator(
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
         metadata=metadata,
     )
 
@@ -119,6 +135,8 @@ def memory_write_decorator(
     *,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     return _memory_event(
@@ -129,6 +147,8 @@ def memory_write_decorator(
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
         metadata=metadata,
     )
 
@@ -142,6 +162,8 @@ def _call_output_pair(
     name: str | None = None,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
     metadata_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> Callable[[F], F]:
@@ -194,8 +216,8 @@ def _call_output_pair(
                     metadata=metadata,
                     bp_metadata=bp_metadata,
                 )
-                if not no_track:
-                    tracker.attach(result, output_event)
+                if track_output and not no_track:
+                    result = tracker.attach(result, output_event, provenance_mode=provenance_mode)
                 return result
 
             return async_wrapper  # type: ignore[return-value]
@@ -246,8 +268,8 @@ def _call_output_pair(
                 metadata=metadata,
                 bp_metadata=bp_metadata,
             )
-            if not no_track:
-                tracker.attach(result, output_event)
+            if track_output and not no_track:
+                result = tracker.attach(result, output_event, provenance_mode=provenance_mode)
             return result
 
         return wrapper  # type: ignore[return-value]
@@ -264,6 +286,8 @@ def _memory_event(
     name: str | None = None,
     exclude_args: list[int] | None = None,
     exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
     def decorate(func: F) -> F:
@@ -309,8 +333,8 @@ def _memory_event(
                     status=SUCCESS,
                     metadata=event_metadata,
                 )
-                if not no_track:
-                    tracker.attach(result, event)
+                if track_output and not no_track:
+                    result = tracker.attach(result, event, provenance_mode=provenance_mode)
                 return result
 
             return async_wrapper  # type: ignore[return-value]
@@ -355,8 +379,8 @@ def _memory_event(
                 status=SUCCESS,
                 metadata=event_metadata,
             )
-            if not no_track:
-                tracker.attach(result, event)
+            if track_output and not no_track:
+                result = tracker.attach(result, event, provenance_mode=provenance_mode)
             return result
 
         return wrapper  # type: ignore[return-value]
