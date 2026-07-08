@@ -1,0 +1,1 @@
+"""Future framework adapter namespace."""
