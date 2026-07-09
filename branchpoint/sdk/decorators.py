@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import functools
 import inspect
 from typing import Any, Callable, TypeVar
@@ -18,9 +20,13 @@ from branchpoint.core.schema import (
     MEMORY_WRITE,
     RETRIEVAL_QUERY,
     RETRIEVAL_RESULT,
+    STATE_READ,
+    STATE_WRITE,
     SUCCESS,
     TOOL_CALL,
     TOOL_OUTPUT,
+    canonical_state_name,
+    canonical_state_path,
     error_metadata,
 )
 from branchpoint.core.serialization import safe_serialize
@@ -145,6 +151,64 @@ def memory_write_decorator(
         tracker,
         MEMORY_WRITE,
         "write",
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def state_read_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    path: str | list[Any] | tuple[Any, ...],
+    state_name: str | None = None,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _state_event(
+        recorder,
+        tracker,
+        STATE_READ,
+        "read",
+        path,
+        state_name,
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def state_write_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    path: str | list[Any] | tuple[Any, ...],
+    state_name: str | None = None,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _state_event(
+        recorder,
+        tracker,
+        STATE_WRITE,
+        "write",
+        path,
+        state_name,
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
@@ -389,6 +453,152 @@ def _memory_event(
     return decorate
 
 
+def _state_event(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    event_type: str,
+    operation: str,
+    path: str | list[Any] | tuple[Any, ...],
+    state_name: str | None,
+    *,
+    name: str | None = None,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    resolved_state_name = canonical_state_name(_metadata_state_name(metadata, state_name))
+    resolved_state_path = canonical_state_path(path)
+
+    def decorate(func: F) -> F:
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
+                upstream_refs, upstream_ids = collect_input_refs(
+                    tracker,
+                    args=args,
+                    kwargs=call_kwargs,
+                    exclude_args=exclude_args,
+                    exclude_kwargs=exclude_kwargs,
+                    manual_input_refs=kwargs.get("bp_input_refs"),
+                    depends_on_values=kwargs.get("bp_depends_on"),
+                )
+                try:
+                    result = await func(*args, **call_kwargs)
+                except Exception as exc:
+                    recorder.emit(
+                        type=event_type,
+                        name=name or func.__name__,
+                        input={"args": args, "kwargs": call_kwargs},
+                        output=safe_serialize(exc),
+                        input_refs=upstream_ids,
+                        status=ERROR,
+                        metadata=_metadata_with_error(
+                            _state_metadata(
+                                metadata,
+                                operation,
+                                resolved_state_name,
+                                resolved_state_path,
+                                upstream_refs,
+                                bp_metadata,
+                                result=None,
+                                call_kwargs=call_kwargs,
+                            ),
+                            exc,
+                        ),
+                    )
+                    raise
+                event = recorder.emit(
+                    type=event_type,
+                    name=name or func.__name__,
+                    input=_state_input_payload(operation, resolved_state_name, resolved_state_path, args, call_kwargs),
+                    output=result,
+                    input_refs=upstream_ids,
+                    status=SUCCESS,
+                    metadata=_state_metadata(
+                        metadata,
+                        operation,
+                        resolved_state_name,
+                        resolved_state_path,
+                        upstream_refs,
+                        bp_metadata,
+                        result=result,
+                        call_kwargs=call_kwargs,
+                    ),
+                )
+                if track_output and not no_track:
+                    result = tracker.attach(result, event, provenance_mode=provenance_mode)
+                return result
+
+            return async_wrapper  # type: ignore[return-value]
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
+            upstream_refs, upstream_ids = collect_input_refs(
+                tracker,
+                args=args,
+                kwargs=call_kwargs,
+                exclude_args=exclude_args,
+                exclude_kwargs=exclude_kwargs,
+                manual_input_refs=kwargs.get("bp_input_refs"),
+                depends_on_values=kwargs.get("bp_depends_on"),
+            )
+            try:
+                result = func(*args, **call_kwargs)
+            except Exception as exc:
+                recorder.emit(
+                    type=event_type,
+                    name=name or func.__name__,
+                    input={"args": args, "kwargs": call_kwargs},
+                    output=safe_serialize(exc),
+                    input_refs=upstream_ids,
+                    status=ERROR,
+                    metadata=_metadata_with_error(
+                        _state_metadata(
+                            metadata,
+                            operation,
+                            resolved_state_name,
+                            resolved_state_path,
+                            upstream_refs,
+                            bp_metadata,
+                            result=None,
+                            call_kwargs=call_kwargs,
+                        ),
+                        exc,
+                    ),
+                )
+                raise
+            event = recorder.emit(
+                type=event_type,
+                name=name or func.__name__,
+                input=_state_input_payload(operation, resolved_state_name, resolved_state_path, args, call_kwargs),
+                output=result,
+                input_refs=upstream_ids,
+                status=SUCCESS,
+                metadata=_state_metadata(
+                    metadata,
+                    operation,
+                    resolved_state_name,
+                    resolved_state_path,
+                    upstream_refs,
+                    bp_metadata,
+                    result=result,
+                    call_kwargs=call_kwargs,
+                ),
+            )
+            if track_output and not no_track:
+                result = tracker.attach(result, event, provenance_mode=provenance_mode)
+            return result
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorate
+
+
 def _emit_call_event(
     recorder: Recorder,
     tracker: ProvenanceTracker,
@@ -524,6 +734,64 @@ def _detect_memory_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | N
         if isinstance(value, str):
             return value
     return None
+
+
+def _metadata_state_name(metadata: dict[str, Any] | None, state_name: str | None) -> str | None:
+    if state_name is not None:
+        return state_name
+    if isinstance(metadata, dict):
+        metadata_state_name = metadata.get("state_name")
+        if isinstance(metadata_state_name, str):
+            return metadata_state_name
+    return None
+
+
+def _state_input_payload(
+    operation: str,
+    state_name: str,
+    state_path: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "state_name": state_name,
+        "state_path": state_path,
+    }
+    if operation == "write":
+        payload["before"] = kwargs.get("before")
+    else:
+        payload["args"] = args
+        payload["kwargs"] = kwargs
+    return payload
+
+
+def _state_metadata(
+    static_metadata: dict[str, Any] | None,
+    operation: str,
+    state_name: str,
+    state_path: str,
+    input_refs: Any,
+    bp_metadata: dict[str, Any] | None,
+    *,
+    result: Any,
+    call_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    dynamic_metadata = {
+        "operation": operation,
+        "state_name": state_name,
+        "state_path": state_path,
+    }
+    if operation == "read":
+        dynamic_metadata["value_hash"] = _hash_state_value(result)
+    else:
+        dynamic_metadata["before_hash"] = _hash_state_value(call_kwargs.get("before"))
+        dynamic_metadata["after_hash"] = _hash_state_value(result)
+    return _event_metadata(static_metadata, dynamic_metadata, input_refs, bp_metadata)
+
+
+def _hash_state_value(value: Any) -> str:
+    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _llm_metadata(kwargs: dict[str, Any]) -> dict[str, Any]:

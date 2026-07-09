@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -81,6 +82,11 @@ METADATA_EXCEPTION_REPR = "exception_repr"
 METADATA_MEMORY_KEY = "memory_key"
 METADATA_OPERATION = "operation"
 METADATA_PROVENANCE = "provenance"
+METADATA_STATE_NAME = "state_name"
+METADATA_STATE_PATH = "state_path"
+METADATA_BEFORE_HASH = "before_hash"
+METADATA_AFTER_HASH = "after_hash"
+METADATA_VALUE_HASH = "value_hash"
 
 STANDARD_METADATA_KEYS = {
     METADATA_CUSTOM_TYPE,
@@ -90,6 +96,11 @@ STANDARD_METADATA_KEYS = {
     METADATA_MEMORY_KEY,
     METADATA_OPERATION,
     METADATA_PROVENANCE,
+    METADATA_STATE_NAME,
+    METADATA_STATE_PATH,
+    METADATA_BEFORE_HASH,
+    METADATA_AFTER_HASH,
+    METADATA_VALUE_HASH,
 }
 
 
@@ -137,6 +148,62 @@ def validate_event_contract(
     validate_schema_version(schema_version)
     validate_event_type(event_type, metadata, strict=strict_event_types)
     validate_status(status)
+
+
+def canonical_state_name(state_name: str | None) -> str:
+    if state_name is None:
+        return "default"
+    if not isinstance(state_name, str) or not state_name.strip():
+        raise EventContractError("BranchPoint state_name must be a non-empty string")
+    return state_name.strip()
+
+
+def canonical_state_path(path: str | Sequence[Any]) -> str:
+    if isinstance(path, str):
+        return _canonicalize_json_pointer(path)
+    if isinstance(path, bytes | bytearray) or not isinstance(path, Sequence):
+        raise EventContractError("BranchPoint state_path must be a JSON Pointer string or sequence of path segments")
+    if not path:
+        return ""
+    return "/" + "/".join(_escape_json_pointer_segment(segment) for segment in path)
+
+
+def state_path_contains(write_path: str, read_path: str) -> bool:
+    canonical_write_path = canonical_state_path(write_path)
+    canonical_read_path = canonical_state_path(read_path)
+    return (
+        canonical_write_path == canonical_read_path
+        or canonical_write_path == ""
+        or canonical_read_path.startswith(f"{canonical_write_path}/")
+    )
+
+
+def _canonicalize_json_pointer(path: str) -> str:
+    if path == "":
+        return ""
+    if not path.startswith("/"):
+        raise EventContractError("BranchPoint state_path must be a JSON Pointer string starting with '/'")
+    return "/" + "/".join(_escape_json_pointer_segment(_unescape_json_pointer_segment(segment)) for segment in path[1:].split("/"))
+
+
+def _escape_json_pointer_segment(segment: Any) -> str:
+    if isinstance(segment, bool) or segment is None:
+        raise EventContractError("BranchPoint state_path segments must be strings or integers")
+    if not isinstance(segment, str | int):
+        raise EventContractError("BranchPoint state_path segments must be strings or integers")
+    return str(segment).replace("~", "~0").replace("/", "~1")
+
+
+def _unescape_json_pointer_segment(segment: str) -> str:
+    index = 0
+    while index < len(segment):
+        if segment[index] == "~":
+            if index + 1 >= len(segment) or segment[index + 1] not in {"0", "1"}:
+                raise EventContractError("BranchPoint state_path contains an invalid JSON Pointer '~' escape")
+            index += 2
+        else:
+            index += 1
+    return segment.replace("~1", "/").replace("~0", "~")
 
 
 def error_metadata(exc: BaseException) -> dict[str, str]:

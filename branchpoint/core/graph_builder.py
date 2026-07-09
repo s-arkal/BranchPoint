@@ -19,6 +19,7 @@ from .graph_types import (
     EDGE_SOURCE_OUTPUT_REF,
     EDGE_SOURCE_PARENT_CHILD,
     EDGE_SOURCE_ROUTING_FOLLOW,
+    EDGE_SOURCE_STATE_PATH_MATCH,
     EXPLICIT_INPUT_REF,
     EXPLICIT_OUTPUT_REF,
     HANDOFF_DEPENDENCY,
@@ -35,6 +36,7 @@ from .graph_types import (
     GraphEdge,
     deterministic_edge_id,
 )
+from .errors import EventContractError
 from .schema import (
     FINAL_OUTPUT,
     HANDOFF,
@@ -42,12 +44,19 @@ from .schema import (
     LLM_OUTPUT,
     MEMORY_READ,
     MEMORY_WRITE,
+    METADATA_STATE_NAME,
+    METADATA_STATE_PATH,
     RETRIEVAL_RESULT,
     ROUTING_DECISION,
+    STATE_READ,
+    STATE_WRITE,
     TOOL_CALL,
     TOOL_OUTPUT,
     VALIDATION_CHECK,
     TraceEvent,
+    canonical_state_name,
+    canonical_state_path,
+    state_path_contains,
 )
 
 
@@ -187,6 +196,41 @@ class GraphBuilder:
                     EDGE_SOURCE_MEMORY_KEY_MATCH,
                 )
 
+        prior_state_writes: list[TraceEvent] = []
+        for event in ordered:
+            if event.type == STATE_WRITE and _state_ref(event) is not None:
+                prior_state_writes.append(event)
+                continue
+            if event.type != STATE_READ:
+                continue
+            read_ref = _state_ref(event)
+            if read_ref is None:
+                continue
+            matching_write = _latest_matching_state_write(prior_state_writes, read_ref)
+            if matching_write is None:
+                continue
+            write_ref = _state_ref(matching_write)
+            if write_ref is None:
+                continue
+            if _has_edge(edges.values(), matching_write.event_id, event.event_id, STATE_DEPENDENCY):
+                continue
+            match_kind = "exact" if write_ref["state_path"] == read_ref["state_path"] else "nested"
+            add(
+                matching_write.event_id,
+                event.event_id,
+                STATE_DEPENDENCY,
+                0.95 if match_kind == "exact" else 0.85,
+                "State read used path written by earlier state write",
+                {
+                    "state_name": read_ref["state_name"],
+                    "state_path": read_ref["state_path"],
+                    "read_state_path": read_ref["state_path"],
+                    "write_state_path": write_ref["state_path"],
+                    "path_match": match_kind,
+                },
+                EDGE_SOURCE_STATE_PATH_MATCH,
+            )
+
         for previous, current in zip(ordered, ordered[1:]):
             if previous.type == ROUTING_DECISION:
                 add(
@@ -226,7 +270,7 @@ class GraphBuilder:
                 and edge.source_event_id != edge.target_event_id
             ):
                 merged[edge.edge_id] = edge
-        return [merged[edge_id] for edge_id in sorted(merged)]
+        return _dedupe_state_dependency_edges([merged[edge_id] for edge_id in sorted(merged)])
 
     def to_networkx(self, events: list[TraceEvent], edges: list[GraphEdge]):
         graph = nx.MultiDiGraph()
@@ -267,6 +311,8 @@ def infer_dependency_edge_type(source_event: TraceEvent | None, target_event: Tr
         return MEMORY_DEPENDENCY
     if source_type == MEMORY_READ and target_type == LLM_CALL:
         return MEMORY_DEPENDENCY
+    if source_type == STATE_WRITE and target_type == STATE_READ:
+        return STATE_DEPENDENCY
     if source_type == LLM_OUTPUT and target_type == MEMORY_WRITE:
         return STATE_DEPENDENCY
     if source_type == LLM_OUTPUT and target_type == FINAL_OUTPUT:
@@ -316,6 +362,56 @@ def _with_inferred_source_metadata(metadata: dict[str, Any] | None, source_kind:
     edge_metadata["source_kind"] = source_kind
     edge_metadata["graph_builder_inferred"] = True
     return edge_metadata
+
+
+def _state_ref(event: TraceEvent) -> dict[str, str] | None:
+    try:
+        state_name = canonical_state_name(event.metadata.get(METADATA_STATE_NAME))
+        state_path = canonical_state_path(event.metadata.get(METADATA_STATE_PATH))
+    except EventContractError:
+        return None
+    return {"state_name": state_name, "state_path": state_path}
+
+
+def _latest_matching_state_write(
+    prior_state_writes: list[TraceEvent],
+    read_ref: dict[str, str],
+) -> TraceEvent | None:
+    for write_event in reversed(prior_state_writes):
+        write_ref = _state_ref(write_event)
+        if write_ref is None or write_ref["state_name"] != read_ref["state_name"]:
+            continue
+        if state_path_contains(write_ref["state_path"], read_ref["state_path"]):
+            return write_event
+    return None
+
+
+def _has_edge(edges: Iterable[GraphEdge], source_event_id: str, target_event_id: str, edge_type: str) -> bool:
+    return any(
+        edge.source_event_id == source_event_id
+        and edge.target_event_id == target_event_id
+        and edge.edge_type == edge_type
+        for edge in edges
+    )
+
+
+def _dedupe_state_dependency_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
+    state_path_match_pairs = {
+        (edge.source_event_id, edge.target_event_id)
+        for edge in edges
+        if edge.edge_type == STATE_DEPENDENCY
+        and edge.metadata.get("source_kind") != EDGE_SOURCE_STATE_PATH_MATCH
+    }
+    kept: dict[str, GraphEdge] = {}
+    for edge in edges:
+        if (
+            edge.edge_type == STATE_DEPENDENCY
+            and edge.metadata.get("source_kind") == EDGE_SOURCE_STATE_PATH_MATCH
+            and (edge.source_event_id, edge.target_event_id) in state_path_match_pairs
+        ):
+            continue
+        kept[edge.edge_id] = edge
+    return [kept[edge_id] for edge_id in sorted(kept)]
 
 
 def _unique_metadata_values(values: Iterable[Any]) -> list[Any]:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,19 @@ from branchpoint.core.graph_types import (
 from branchpoint.core.provenance import ProvenanceTracker
 from branchpoint.core.recorder import Recorder
 from branchpoint.core.refs import ProvenanceRef, collect_input_refs, refs_to_dicts
+from branchpoint.core.schema import (
+    METADATA_AFTER_HASH,
+    METADATA_BEFORE_HASH,
+    METADATA_OPERATION,
+    METADATA_STATE_NAME,
+    METADATA_STATE_PATH,
+    METADATA_VALUE_HASH,
+    STATE_READ,
+    STATE_WRITE,
+    SUCCESS,
+    canonical_state_name,
+    canonical_state_path,
+)
 from branchpoint.core.serialization import safe_serialize
 from branchpoint.storage.blob_store import BlobStore
 from branchpoint.storage.sqlite_store import SQLiteEventStore
@@ -29,6 +44,8 @@ from .decorators import (
     memory_read_decorator,
     memory_write_decorator,
     retrieval_decorator,
+    state_read_decorator,
+    state_write_decorator,
     tool_decorator,
 )
 from .prompt import BranchPointPrompt
@@ -84,6 +101,93 @@ class BranchPoint:
         reason: str = "depends_on_context",
     ):
         return _DependencyContext(self.provenance_tracker, values, event_ids, reason)
+
+    def state_read(
+        self,
+        path: str | list[Any] | tuple[Any, ...],
+        value: Any = None,
+        *,
+        state_name: str | None = None,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        input_refs: Any = None,
+        status: str = SUCCESS,
+        auto_refs: bool = True,
+    ):
+        resolved_state_name = canonical_state_name(_metadata_state_name(metadata, state_name))
+        resolved_state_path = canonical_state_path(path)
+        event_metadata = _state_event_metadata(
+            metadata,
+            operation="read",
+            state_name=resolved_state_name,
+            state_path=resolved_state_path,
+            value=value,
+        )
+        if auto_refs:
+            detail_refs, event_input_refs = collect_input_refs(
+                self.provenance_tracker,
+                manual_input_refs=input_refs,
+                include_context_refs=True,
+            )
+            event_metadata = _metadata_with_provenance(event_metadata, detail_refs)
+        else:
+            event_input_refs = list(input_refs or [])
+        return self.recorder.emit(
+            type=STATE_READ,
+            name=name,
+            input={METADATA_STATE_NAME: resolved_state_name, METADATA_STATE_PATH: resolved_state_path},
+            output=value,
+            input_refs=event_input_refs,
+            status=status,
+            metadata=event_metadata,
+        )
+
+    def state_write(
+        self,
+        path: str | list[Any] | tuple[Any, ...],
+        *,
+        before: Any = None,
+        after: Any = None,
+        state_name: str | None = None,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        input_refs: Any = None,
+        status: str = SUCCESS,
+        auto_refs: bool = True,
+    ):
+        resolved_state_name = canonical_state_name(_metadata_state_name(metadata, state_name))
+        resolved_state_path = canonical_state_path(path)
+        event_metadata = _state_event_metadata(
+            metadata,
+            operation="write",
+            state_name=resolved_state_name,
+            state_path=resolved_state_path,
+            before=before,
+            after=after,
+        )
+        if auto_refs:
+            detail_refs, event_input_refs = collect_input_refs(
+                self.provenance_tracker,
+                args=(before, after),
+                manual_input_refs=input_refs,
+                include_context_refs=True,
+            )
+            event_metadata = _metadata_with_provenance(event_metadata, detail_refs)
+        else:
+            event_input_refs = list(input_refs or [])
+        return self.recorder.emit(
+            type=STATE_WRITE,
+            name=name,
+            input={
+                METADATA_STATE_NAME: resolved_state_name,
+                METADATA_STATE_PATH: resolved_state_path,
+                "before": before,
+            },
+            output=after,
+            input_refs=event_input_refs,
+            status=status,
+            metadata=event_metadata,
+        )
 
     def edge(
         self,
@@ -270,6 +374,56 @@ class BranchPoint:
             metadata=metadata,
         )
 
+    def state_reader(
+        self,
+        path: str | list[Any] | tuple[Any, ...],
+        name: str | None = None,
+        *,
+        state_name: str | None = None,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return state_read_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            path=path,
+            state_name=state_name,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
+    def state_writer(
+        self,
+        path: str | list[Any] | tuple[Any, ...],
+        name: str | None = None,
+        *,
+        state_name: str | None = None,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return state_write_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            path=path,
+            state_name=state_name,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
     def retrieval(
         self,
         name: str | None = None,
@@ -333,6 +487,43 @@ def _metadata_with_provenance(metadata: dict[str, Any] | None, input_refs: Any) 
     provenance["input_refs_detail"] = refs_to_dicts(input_refs)
     event_metadata["provenance"] = provenance
     return event_metadata
+
+
+def _metadata_state_name(metadata: dict[str, Any] | None, state_name: str | None) -> str | None:
+    if state_name is not None:
+        return state_name
+    if isinstance(metadata, dict):
+        metadata_state_name = metadata.get(METADATA_STATE_NAME)
+        if isinstance(metadata_state_name, str):
+            return metadata_state_name
+    return None
+
+
+def _state_event_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    operation: str,
+    state_name: str,
+    state_path: str,
+    value: Any = None,
+    before: Any = None,
+    after: Any = None,
+) -> dict[str, Any]:
+    event_metadata = dict(metadata or {})
+    event_metadata[METADATA_OPERATION] = operation
+    event_metadata[METADATA_STATE_NAME] = state_name
+    event_metadata[METADATA_STATE_PATH] = state_path
+    if operation == "read":
+        event_metadata[METADATA_VALUE_HASH] = _hash_state_value(value)
+    else:
+        event_metadata[METADATA_BEFORE_HASH] = _hash_state_value(before)
+        event_metadata[METADATA_AFTER_HASH] = _hash_state_value(after)
+    return event_metadata
+
+
+def _hash_state_value(value: Any) -> str:
+    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _replace_ref_reason(ref: ProvenanceRef, reason: str) -> ProvenanceRef:
