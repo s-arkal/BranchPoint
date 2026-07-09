@@ -6,11 +6,22 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from branchpoint.core.context import reset_dependency_refs, set_dependency_refs
+from branchpoint.core.context import get_current_run_id, reset_dependency_refs, set_dependency_refs
+from branchpoint.core.errors import EventContractError, NoActiveTraceError, TraceNotFoundError
 from branchpoint.core.graph_builder import GraphBuilder
+from branchpoint.core.graph_types import (
+    EDGE_SOURCE_EXPLICIT_USER,
+    EDGE_WEIGHTS,
+    GraphEdge,
+    deterministic_explicit_edge_id,
+    normalize_edge_type,
+    validate_edge_source_kind,
+    validate_edge_weight,
+)
 from branchpoint.core.provenance import ProvenanceTracker
 from branchpoint.core.recorder import Recorder
 from branchpoint.core.refs import ProvenanceRef, collect_input_refs, refs_to_dicts
+from branchpoint.core.serialization import safe_serialize
 from branchpoint.storage.blob_store import BlobStore
 from branchpoint.storage.sqlite_store import SQLiteEventStore
 from .decorators import (
@@ -73,6 +84,79 @@ class BranchPoint:
         reason: str = "depends_on_context",
     ):
         return _DependencyContext(self.provenance_tracker, values, event_ids, reason)
+
+    def edge(
+        self,
+        source_event_id: str,
+        target_event_id: str,
+        edge_type: str,
+        weight: float | None = None,
+        confidence: float = 1.0,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        *,
+        source_kind: str = EDGE_SOURCE_EXPLICIT_USER,
+        run_id: str | None = None,
+        allow_self_edge: bool = False,
+    ) -> GraphEdge:
+        active_run_id = get_current_run_id()
+        resolved_run_id = run_id or active_run_id
+        if resolved_run_id is None:
+            raise NoActiveTraceError("edge requires an active trace or explicit run_id")
+        if active_run_id is not None and run_id is not None and run_id != active_run_id:
+            raise EventContractError("edge run_id cannot differ from the active trace run_id")
+        if source_event_id == target_event_id and not allow_self_edge:
+            raise EventContractError("BranchPoint explicit edges cannot point an event to itself")
+
+        run = self.store.get_run(resolved_run_id)
+        if run is None:
+            raise TraceNotFoundError(f"BranchPoint run {resolved_run_id!r} does not exist")
+
+        events_by_id = {event.event_id: event for event in self.store.list_events(resolved_run_id)}
+        missing_event_ids = [
+            event_id
+            for event_id in (source_event_id, target_event_id)
+            if event_id not in events_by_id
+        ]
+        if missing_event_ids:
+            missing = ", ".join(repr(event_id) for event_id in missing_event_ids)
+            raise EventContractError(
+                f"BranchPoint explicit edge endpoints must be events in run {resolved_run_id!r}; missing: {missing}"
+            )
+
+        normalized_edge_type = normalize_edge_type(edge_type)
+        validate_edge_source_kind(source_kind)
+        resolved_weight = validate_edge_weight(
+            "weight",
+            EDGE_WEIGHTS[normalized_edge_type] if weight is None else weight,
+        )
+        resolved_confidence = validate_edge_weight("confidence", confidence)
+        edge_metadata = dict(safe_serialize(metadata or {}))
+        edge_metadata["source_kind"] = source_kind
+        edge_metadata["explicit"] = True
+        if normalized_edge_type != edge_type:
+            edge_metadata["edge_type_alias"] = edge_type
+
+        edge = GraphEdge(
+            edge_id=deterministic_explicit_edge_id(
+                resolved_run_id,
+                source_event_id,
+                target_event_id,
+                normalized_edge_type,
+                source_kind,
+                reason,
+            ),
+            run_id=resolved_run_id,
+            source_event_id=source_event_id,
+            target_event_id=target_event_id,
+            edge_type=normalized_edge_type,
+            weight=resolved_weight,
+            confidence=resolved_confidence,
+            reason=reason,
+            metadata=edge_metadata,
+        )
+        self.store.append_edge(edge)
+        return edge
 
     def prompt(self) -> BranchPointPrompt:
         return BranchPointPrompt(self.provenance_tracker)
