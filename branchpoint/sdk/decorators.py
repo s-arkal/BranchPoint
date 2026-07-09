@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
+import time
+from dataclasses import dataclass
 from typing import Any, Callable, TypeVar
 
 from branchpoint.core.ids import new_span_id
@@ -12,24 +15,33 @@ from branchpoint.core.recorder import Recorder
 from branchpoint.core.refs import collect_input_refs, refs_to_dicts
 from branchpoint.core.schema import (
     ERROR,
+    CANCELLED,
+    HANDOFF,
     LLM_CALL,
     LLM_OUTPUT,
     MEMORY_READ,
     MEMORY_WRITE,
     RETRIEVAL_QUERY,
     RETRIEVAL_RESULT,
+    RETRY,
+    ROUTING_DECISION,
     STATE_READ,
     STATE_WRITE,
     SUCCESS,
+    TIMEOUT,
     TOOL_CALL,
     TOOL_OUTPUT,
+    VALIDATION_CHECK,
     canonical_state_name,
     canonical_state_path,
     error_metadata,
+    utc_now_iso,
 )
 from branchpoint.core.serialization import safe_serialize
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+RESERVED_KWARGS = frozenset({"bp_input_refs", "bp_depends_on", "bp_metadata", "bp_no_track"})
 
 
 def tool_decorator(
@@ -99,6 +111,106 @@ def retrieval_decorator(
         tracker,
         RETRIEVAL_QUERY,
         RETRIEVAL_RESULT,
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def validation_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _single_event(
+        recorder,
+        tracker,
+        VALIDATION_CHECK,
+        {"operation": "validation"},
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def route_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _single_event(
+        recorder,
+        tracker,
+        ROUTING_DECISION,
+        {"operation": "route"},
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def handoff_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _single_event(
+        recorder,
+        tracker,
+        HANDOFF,
+        {"operation": "handoff"},
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def retry_decorator(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    name: str | None = None,
+    *,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
+    return _single_event(
+        recorder,
+        tracker,
+        RETRY,
+        {"operation": "retry"},
         name=name,
         exclude_args=exclude_args,
         exclude_kwargs=exclude_kwargs,
@@ -235,6 +347,7 @@ def _call_output_pair(
 
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = _start_timing()
                 call_event, span_id, upstream_refs, upstream_ids = _emit_call_event(
                     recorder,
                     tracker,
@@ -246,12 +359,13 @@ def _call_output_pair(
                     exclude_kwargs,
                     metadata,
                     metadata_builder,
+                    timestamp_start=start.timestamp_start,
                 )
                 call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
                 try:
                     with recorder.child_context(call_event.event_id, span_id):
                         result = await func(*args, **call_kwargs)
-                except Exception as exc:
+                except asyncio.CancelledError as exc:
                     _emit_output_event(
                         recorder,
                         output_type,
@@ -261,11 +375,72 @@ def _call_output_pair(
                         upstream_ids,
                         upstream_refs,
                         output=safe_serialize(exc),
-                        status=ERROR,
+                        status=CANCELLED,
                         metadata=metadata,
-                        bp_metadata=_metadata_with_error(bp_metadata, exc),
+                        bp_metadata=_metadata_with_exception(bp_metadata, exc, status=CANCELLED),
+                        timing=start.finish(),
+                        dynamic_metadata=_llm_output_metadata(call_kwargs, metadata, bp_metadata)
+                        if output_type == LLM_OUTPUT
+                        else None,
                     )
                     raise
+                except Exception as exc:
+                    status = _exception_status(exc)
+                    _emit_output_event(
+                        recorder,
+                        output_type,
+                        name or func.__name__,
+                        call_event.event_id,
+                        span_id,
+                        upstream_ids,
+                        upstream_refs,
+                        output=safe_serialize(exc),
+                        status=status,
+                        metadata=metadata,
+                        bp_metadata=_metadata_with_exception(bp_metadata, exc, status=status),
+                        timing=start.finish(),
+                        dynamic_metadata=_llm_output_metadata(call_kwargs, metadata, bp_metadata)
+                        if output_type == LLM_OUTPUT
+                        else None,
+                    )
+                    raise
+                streaming_metadata = _llm_output_metadata(call_kwargs, metadata, bp_metadata) if output_type == LLM_OUTPUT else {}
+                if streaming_metadata.get("streaming") and _is_sync_stream(result):
+                    return _wrap_sync_stream(
+                        result,
+                        recorder=recorder,
+                        tracker=tracker,
+                        output_type=output_type,
+                        name=name or func.__name__,
+                        call_event_id=call_event.event_id,
+                        span_id=span_id,
+                        upstream_ids=upstream_ids,
+                        upstream_refs=upstream_refs,
+                        metadata=metadata,
+                        bp_metadata=bp_metadata,
+                        timing=start,
+                        dynamic_metadata=streaming_metadata,
+                        track_output=track_output and not no_track,
+                        provenance_mode=provenance_mode,
+                    )
+                if streaming_metadata.get("streaming") and _is_async_stream(result):
+                    return _wrap_async_stream(
+                        result,
+                        recorder=recorder,
+                        tracker=tracker,
+                        output_type=output_type,
+                        name=name or func.__name__,
+                        call_event_id=call_event.event_id,
+                        span_id=span_id,
+                        upstream_ids=upstream_ids,
+                        upstream_refs=upstream_refs,
+                        metadata=metadata,
+                        bp_metadata=bp_metadata,
+                        timing=start,
+                        dynamic_metadata=streaming_metadata,
+                        track_output=track_output and not no_track,
+                        provenance_mode=provenance_mode,
+                    )
                 output_event = _emit_output_event(
                     recorder,
                     output_type,
@@ -278,6 +453,8 @@ def _call_output_pair(
                     status=SUCCESS,
                     metadata=metadata,
                     bp_metadata=bp_metadata,
+                    timing=start.finish(),
+                    dynamic_metadata=streaming_metadata,
                 )
                 if track_output and not no_track:
                     result = tracker.attach(result, output_event, provenance_mode=provenance_mode)
@@ -287,6 +464,7 @@ def _call_output_pair(
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = _start_timing()
             call_event, span_id, upstream_refs, upstream_ids = _emit_call_event(
                 recorder,
                 tracker,
@@ -298,12 +476,13 @@ def _call_output_pair(
                 exclude_kwargs,
                 metadata,
                 metadata_builder,
+                timestamp_start=start.timestamp_start,
             )
             call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
             try:
                 with recorder.child_context(call_event.event_id, span_id):
                     result = func(*args, **call_kwargs)
-            except Exception as exc:
+            except asyncio.CancelledError as exc:
                 _emit_output_event(
                     recorder,
                     output_type,
@@ -313,11 +492,54 @@ def _call_output_pair(
                     upstream_ids,
                     upstream_refs,
                     output=safe_serialize(exc),
-                    status=ERROR,
+                    status=CANCELLED,
                     metadata=metadata,
-                    bp_metadata=_metadata_with_error(bp_metadata, exc),
+                    bp_metadata=_metadata_with_exception(bp_metadata, exc, status=CANCELLED),
+                    timing=start.finish(),
+                    dynamic_metadata=_llm_output_metadata(call_kwargs, metadata, bp_metadata)
+                    if output_type == LLM_OUTPUT
+                    else None,
                 )
                 raise
+            except Exception as exc:
+                status = _exception_status(exc)
+                _emit_output_event(
+                    recorder,
+                    output_type,
+                    name or func.__name__,
+                    call_event.event_id,
+                    span_id,
+                    upstream_ids,
+                    upstream_refs,
+                    output=safe_serialize(exc),
+                    status=status,
+                    metadata=metadata,
+                    bp_metadata=_metadata_with_exception(bp_metadata, exc, status=status),
+                    timing=start.finish(),
+                    dynamic_metadata=_llm_output_metadata(call_kwargs, metadata, bp_metadata)
+                    if output_type == LLM_OUTPUT
+                    else None,
+                )
+                raise
+            streaming_metadata = _llm_output_metadata(call_kwargs, metadata, bp_metadata) if output_type == LLM_OUTPUT else {}
+            if streaming_metadata.get("streaming") and _is_sync_stream(result):
+                return _wrap_sync_stream(
+                    result,
+                    recorder=recorder,
+                    tracker=tracker,
+                    output_type=output_type,
+                    name=name or func.__name__,
+                    call_event_id=call_event.event_id,
+                    span_id=span_id,
+                    upstream_ids=upstream_ids,
+                    upstream_refs=upstream_refs,
+                    metadata=metadata,
+                    bp_metadata=bp_metadata,
+                    timing=start,
+                    dynamic_metadata=streaming_metadata,
+                    track_output=track_output and not no_track,
+                    provenance_mode=provenance_mode,
+                )
             output_event = _emit_output_event(
                 recorder,
                 output_type,
@@ -330,6 +552,8 @@ def _call_output_pair(
                 status=SUCCESS,
                 metadata=metadata,
                 bp_metadata=bp_metadata,
+                timing=start.finish(),
+                dynamic_metadata=streaming_metadata,
             )
             if track_output and not no_track:
                 result = tracker.attach(result, output_event, provenance_mode=provenance_mode)
@@ -353,11 +577,39 @@ def _memory_event(
     provenance_mode: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Callable[[F], F]:
+    return _single_event(
+        recorder,
+        tracker,
+        event_type,
+        lambda args, call_kwargs, result: _memory_metadata(operation, args, call_kwargs),
+        name=name,
+        exclude_args=exclude_args,
+        exclude_kwargs=exclude_kwargs,
+        track_output=track_output,
+        provenance_mode=provenance_mode,
+        metadata=metadata,
+    )
+
+
+def _single_event(
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    event_type: str,
+    dynamic_metadata: dict[str, Any] | Callable[[tuple[Any, ...], dict[str, Any], Any], dict[str, Any]],
+    *,
+    name: str | None = None,
+    exclude_args: list[int] | None = None,
+    exclude_kwargs: list[str] | None = None,
+    track_output: bool = True,
+    provenance_mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Callable[[F], F]:
     def decorate(func: F) -> F:
         if inspect.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = _start_timing()
                 call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
                 upstream_refs, upstream_ids = collect_input_refs(
                     tracker,
@@ -368,33 +620,59 @@ def _memory_event(
                     manual_input_refs=kwargs.get("bp_input_refs"),
                     depends_on_values=kwargs.get("bp_depends_on"),
                 )
-                event_metadata = _event_metadata(
-                    metadata,
-                    _memory_metadata(operation, args, call_kwargs),
-                    upstream_refs,
-                    bp_metadata,
-                )
                 try:
                     result = await func(*args, **call_kwargs)
-                except Exception as exc:
-                    recorder.emit(
-                        type=event_type,
-                        name=name or func.__name__,
-                        input={"args": args, "kwargs": call_kwargs},
-                        output=safe_serialize(exc),
-                        input_refs=upstream_ids,
-                        status=ERROR,
-                        metadata=_metadata_with_error(event_metadata, exc),
+                except asyncio.CancelledError as exc:
+                    _emit_single_event(
+                        recorder,
+                        event_type,
+                        name or func.__name__,
+                        args,
+                        call_kwargs,
+                        safe_serialize(exc),
+                        upstream_ids,
+                        upstream_refs,
+                        metadata,
+                        bp_metadata,
+                        dynamic_metadata,
+                        start.finish(),
+                        status=CANCELLED,
+                        exc=exc,
                     )
                     raise
-                event = recorder.emit(
-                    type=event_type,
-                    name=name or func.__name__,
-                    input={"args": args, "kwargs": call_kwargs},
-                    output=result,
-                    input_refs=upstream_ids,
+                except Exception as exc:
+                    status = _exception_status(exc)
+                    _emit_single_event(
+                        recorder,
+                        event_type,
+                        name or func.__name__,
+                        args,
+                        call_kwargs,
+                        safe_serialize(exc),
+                        upstream_ids,
+                        upstream_refs,
+                        metadata,
+                        bp_metadata,
+                        dynamic_metadata,
+                        start.finish(),
+                        status=status,
+                        exc=exc,
+                    )
+                    raise
+                event = _emit_single_event(
+                    recorder,
+                    event_type,
+                    name or func.__name__,
+                    args,
+                    call_kwargs,
+                    result,
+                    upstream_ids,
+                    upstream_refs,
+                    metadata,
+                    bp_metadata,
+                    dynamic_metadata,
+                    start.finish(),
                     status=SUCCESS,
-                    metadata=event_metadata,
                 )
                 if track_output and not no_track:
                     result = tracker.attach(result, event, provenance_mode=provenance_mode)
@@ -404,6 +682,7 @@ def _memory_event(
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = _start_timing()
             call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
             upstream_refs, upstream_ids = collect_input_refs(
                 tracker,
@@ -414,33 +693,59 @@ def _memory_event(
                 manual_input_refs=kwargs.get("bp_input_refs"),
                 depends_on_values=kwargs.get("bp_depends_on"),
             )
-            event_metadata = _event_metadata(
-                metadata,
-                _memory_metadata(operation, args, call_kwargs),
-                upstream_refs,
-                bp_metadata,
-            )
             try:
                 result = func(*args, **call_kwargs)
-            except Exception as exc:
-                recorder.emit(
-                    type=event_type,
-                    name=name or func.__name__,
-                    input={"args": args, "kwargs": call_kwargs},
-                    output=safe_serialize(exc),
-                    input_refs=upstream_ids,
-                    status=ERROR,
-                    metadata=_metadata_with_error(event_metadata, exc),
+            except asyncio.CancelledError as exc:
+                _emit_single_event(
+                    recorder,
+                    event_type,
+                    name or func.__name__,
+                    args,
+                    call_kwargs,
+                    safe_serialize(exc),
+                    upstream_ids,
+                    upstream_refs,
+                    metadata,
+                    bp_metadata,
+                    dynamic_metadata,
+                    start.finish(),
+                    status=CANCELLED,
+                    exc=exc,
                 )
                 raise
-            event = recorder.emit(
-                type=event_type,
-                name=name or func.__name__,
-                input={"args": args, "kwargs": call_kwargs},
-                output=result,
-                input_refs=upstream_ids,
+            except Exception as exc:
+                status = _exception_status(exc)
+                _emit_single_event(
+                    recorder,
+                    event_type,
+                    name or func.__name__,
+                    args,
+                    call_kwargs,
+                    safe_serialize(exc),
+                    upstream_ids,
+                    upstream_refs,
+                    metadata,
+                    bp_metadata,
+                    dynamic_metadata,
+                    start.finish(),
+                    status=status,
+                    exc=exc,
+                )
+                raise
+            event = _emit_single_event(
+                recorder,
+                event_type,
+                name or func.__name__,
+                args,
+                call_kwargs,
+                result,
+                upstream_ids,
+                upstream_refs,
+                metadata,
+                bp_metadata,
+                dynamic_metadata,
+                start.finish(),
                 status=SUCCESS,
-                metadata=event_metadata,
             )
             if track_output and not no_track:
                 result = tracker.attach(result, event, provenance_mode=provenance_mode)
@@ -474,6 +779,7 @@ def _state_event(
 
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = _start_timing()
                 call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
                 upstream_refs, upstream_ids = collect_input_refs(
                     tracker,
@@ -486,30 +792,70 @@ def _state_event(
                 )
                 try:
                     result = await func(*args, **call_kwargs)
-                except Exception as exc:
+                except asyncio.CancelledError as exc:
+                    timing = start.finish()
                     recorder.emit(
                         type=event_type,
                         name=name or func.__name__,
                         input={"args": args, "kwargs": call_kwargs},
                         output=safe_serialize(exc),
                         input_refs=upstream_ids,
-                        status=ERROR,
-                        metadata=_metadata_with_error(
-                            _state_metadata(
-                                recorder,
-                                metadata,
-                                operation,
-                                resolved_state_name,
-                                resolved_state_path,
-                                upstream_refs,
-                                bp_metadata,
-                                result=None,
-                                call_kwargs=call_kwargs,
+                        status=CANCELLED,
+                        metadata=_with_timing(
+                            _metadata_with_exception(
+                                _state_metadata(
+                                    recorder,
+                                    metadata,
+                                    operation,
+                                    resolved_state_name,
+                                    resolved_state_path,
+                                    upstream_refs,
+                                    bp_metadata,
+                                    result=None,
+                                    call_kwargs=call_kwargs,
+                                ),
+                                exc,
+                                status=CANCELLED,
                             ),
-                            exc,
+                            timing,
                         ),
+                        timestamp_start=start.timestamp_start,
+                        timestamp_end=timing.timestamp_end,
                     )
                     raise
+                except Exception as exc:
+                    status = _exception_status(exc)
+                    timing = start.finish()
+                    recorder.emit(
+                        type=event_type,
+                        name=name or func.__name__,
+                        input={"args": args, "kwargs": call_kwargs},
+                        output=safe_serialize(exc),
+                        input_refs=upstream_ids,
+                        status=status,
+                        metadata=_with_timing(
+                            _metadata_with_exception(
+                                _state_metadata(
+                                    recorder,
+                                    metadata,
+                                    operation,
+                                    resolved_state_name,
+                                    resolved_state_path,
+                                    upstream_refs,
+                                    bp_metadata,
+                                    result=None,
+                                    call_kwargs=call_kwargs,
+                                ),
+                                exc,
+                                status=status,
+                            ),
+                            timing,
+                        ),
+                        timestamp_start=start.timestamp_start,
+                        timestamp_end=timing.timestamp_end,
+                    )
+                    raise
+                timing = start.finish()
                 event = recorder.emit(
                     type=event_type,
                     name=name or func.__name__,
@@ -517,17 +863,22 @@ def _state_event(
                     output=result,
                     input_refs=upstream_ids,
                     status=SUCCESS,
-                    metadata=_state_metadata(
-                        recorder,
-                        metadata,
-                        operation,
-                        resolved_state_name,
-                        resolved_state_path,
-                        upstream_refs,
-                        bp_metadata,
-                        result=result,
-                        call_kwargs=call_kwargs,
+                    metadata=_with_timing(
+                        _state_metadata(
+                            recorder,
+                            metadata,
+                            operation,
+                            resolved_state_name,
+                            resolved_state_path,
+                            upstream_refs,
+                            bp_metadata,
+                            result=result,
+                            call_kwargs=call_kwargs,
+                        ),
+                        timing,
                     ),
+                    timestamp_start=start.timestamp_start,
+                    timestamp_end=timing.timestamp_end,
                 )
                 if track_output and not no_track:
                     result = tracker.attach(result, event, provenance_mode=provenance_mode)
@@ -537,6 +888,7 @@ def _state_event(
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = _start_timing()
             call_kwargs, bp_metadata, no_track = _split_reserved_kwargs(kwargs)
             upstream_refs, upstream_ids = collect_input_refs(
                 tracker,
@@ -549,30 +901,70 @@ def _state_event(
             )
             try:
                 result = func(*args, **call_kwargs)
-            except Exception as exc:
+            except asyncio.CancelledError as exc:
+                timing = start.finish()
                 recorder.emit(
                     type=event_type,
                     name=name or func.__name__,
                     input={"args": args, "kwargs": call_kwargs},
                     output=safe_serialize(exc),
                     input_refs=upstream_ids,
-                    status=ERROR,
-                    metadata=_metadata_with_error(
-                        _state_metadata(
-                            recorder,
-                            metadata,
-                            operation,
-                            resolved_state_name,
-                            resolved_state_path,
-                            upstream_refs,
-                            bp_metadata,
-                            result=None,
-                            call_kwargs=call_kwargs,
+                    status=CANCELLED,
+                    metadata=_with_timing(
+                        _metadata_with_exception(
+                            _state_metadata(
+                                recorder,
+                                metadata,
+                                operation,
+                                resolved_state_name,
+                                resolved_state_path,
+                                upstream_refs,
+                                bp_metadata,
+                                result=None,
+                                call_kwargs=call_kwargs,
+                            ),
+                            exc,
+                            status=CANCELLED,
                         ),
-                        exc,
+                        timing,
                     ),
+                    timestamp_start=start.timestamp_start,
+                    timestamp_end=timing.timestamp_end,
                 )
                 raise
+            except Exception as exc:
+                status = _exception_status(exc)
+                timing = start.finish()
+                recorder.emit(
+                    type=event_type,
+                    name=name or func.__name__,
+                    input={"args": args, "kwargs": call_kwargs},
+                    output=safe_serialize(exc),
+                    input_refs=upstream_ids,
+                    status=status,
+                    metadata=_with_timing(
+                        _metadata_with_exception(
+                            _state_metadata(
+                                recorder,
+                                metadata,
+                                operation,
+                                resolved_state_name,
+                                resolved_state_path,
+                                upstream_refs,
+                                bp_metadata,
+                                result=None,
+                                call_kwargs=call_kwargs,
+                            ),
+                            exc,
+                            status=status,
+                        ),
+                        timing,
+                    ),
+                    timestamp_start=start.timestamp_start,
+                    timestamp_end=timing.timestamp_end,
+                )
+                raise
+            timing = start.finish()
             event = recorder.emit(
                 type=event_type,
                 name=name or func.__name__,
@@ -580,17 +972,22 @@ def _state_event(
                 output=result,
                 input_refs=upstream_ids,
                 status=SUCCESS,
-                metadata=_state_metadata(
-                    recorder,
-                    metadata,
-                    operation,
-                    resolved_state_name,
-                    resolved_state_path,
-                    upstream_refs,
-                    bp_metadata,
-                    result=result,
-                    call_kwargs=call_kwargs,
+                metadata=_with_timing(
+                    _state_metadata(
+                        recorder,
+                        metadata,
+                        operation,
+                        resolved_state_name,
+                        resolved_state_path,
+                        upstream_refs,
+                        bp_metadata,
+                        result=result,
+                        call_kwargs=call_kwargs,
+                    ),
+                    timing,
                 ),
+                timestamp_start=start.timestamp_start,
+                timestamp_end=timing.timestamp_end,
             )
             if track_output and not no_track:
                 result = tracker.attach(result, event, provenance_mode=provenance_mode)
@@ -612,6 +1009,8 @@ def _emit_call_event(
     exclude_kwargs: list[str] | None,
     metadata: dict[str, Any] | None,
     metadata_builder: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    *,
+    timestamp_start: str | None = None,
 ) -> tuple[Any, str, Any, list[str]]:
     call_kwargs, bp_metadata, _ = _split_reserved_kwargs(kwargs)
     upstream_refs, upstream_ids = collect_input_refs(
@@ -634,6 +1033,7 @@ def _emit_call_event(
         status=SUCCESS,
         span_id=span_id,
         metadata=event_metadata,
+        timestamp_start=timestamp_start,
     )
     return call_event, span_id, upstream_refs, upstream_ids
 
@@ -651,7 +1051,12 @@ def _emit_output_event(
     status: str,
     metadata: dict[str, Any] | None,
     bp_metadata: dict[str, Any] | None = None,
+    timing: "_FinishedTiming | None" = None,
+    dynamic_metadata: dict[str, Any] | None = None,
 ) -> Any:
+    event_metadata = _event_metadata(metadata, dynamic_metadata or {}, upstream_refs, bp_metadata)
+    if timing is not None:
+        event_metadata = _with_timing(event_metadata, timing)
     return recorder.emit(
         type=output_type,
         name=name,
@@ -660,8 +1065,271 @@ def _emit_output_event(
         status=status,
         parent_id=call_event_id,
         span_id=span_id,
-        metadata=_event_metadata(metadata, {}, upstream_refs, bp_metadata),
+        metadata=event_metadata,
+        timestamp_end=timing.timestamp_end if timing is not None else None,
     )
+
+
+@dataclass(frozen=True)
+class _StartedTiming:
+    timestamp_start: str
+    perf_start: float
+
+    def finish(self) -> "_FinishedTiming":
+        return _FinishedTiming(
+            timestamp_start=self.timestamp_start,
+            timestamp_end=utc_now_iso(),
+            latency_ms=max(0.0, round((time.perf_counter() - self.perf_start) * 1000, 3)),
+        )
+
+
+@dataclass(frozen=True)
+class _FinishedTiming:
+    timestamp_start: str
+    timestamp_end: str
+    latency_ms: float
+
+
+def _start_timing() -> _StartedTiming:
+    return _StartedTiming(timestamp_start=utc_now_iso(), perf_start=time.perf_counter())
+
+
+def _with_timing(metadata: dict[str, Any], timing: _FinishedTiming) -> dict[str, Any]:
+    event_metadata = dict(metadata)
+    event_metadata["timestamp_start"] = timing.timestamp_start
+    event_metadata["timestamp_end"] = timing.timestamp_end
+    event_metadata["latency_ms"] = timing.latency_ms
+    return event_metadata
+
+
+def _emit_single_event(
+    recorder: Recorder,
+    event_type: str,
+    name: str,
+    args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    output: Any,
+    upstream_ids: list[str],
+    upstream_refs: Any,
+    static_metadata: dict[str, Any] | None,
+    bp_metadata: dict[str, Any] | None,
+    dynamic_metadata: dict[str, Any] | Callable[[tuple[Any, ...], dict[str, Any], Any], dict[str, Any]],
+    timing: _FinishedTiming,
+    *,
+    status: str,
+    exc: BaseException | None = None,
+) -> Any:
+    resolved_dynamic_metadata = (
+        dynamic_metadata(args, call_kwargs, output) if callable(dynamic_metadata) else dynamic_metadata
+    )
+    event_metadata = _event_metadata(static_metadata, resolved_dynamic_metadata, upstream_refs, bp_metadata)
+    if exc is not None:
+        event_metadata = _metadata_with_exception(event_metadata, exc, status=status)
+    event_metadata = _with_timing(event_metadata, timing)
+    return recorder.emit(
+        type=event_type,
+        name=name,
+        input={"args": args, "kwargs": call_kwargs},
+        output=output,
+        input_refs=upstream_ids,
+        status=status,
+        metadata=event_metadata,
+        timestamp_start=timing.timestamp_start,
+        timestamp_end=timing.timestamp_end,
+    )
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError)
+
+
+def _exception_status(exc: BaseException) -> str:
+    return TIMEOUT if _is_timeout(exc) else ERROR
+
+
+def _metadata_with_exception(metadata: dict[str, Any] | None, exc: BaseException, *, status: str) -> dict[str, Any]:
+    event_metadata = dict(metadata or {})
+    _merge_metadata(event_metadata, error_metadata(exc))
+    if status == TIMEOUT:
+        event_metadata["timeout"] = True
+    if status == CANCELLED:
+        event_metadata["cancelled"] = True
+    return event_metadata
+
+
+def _is_sync_stream(value: Any) -> bool:
+    return (
+        hasattr(value, "__iter__")
+        and not isinstance(value, (str, bytes, bytearray, dict, list, tuple, set, frozenset))
+    )
+
+
+def _is_async_stream(value: Any) -> bool:
+    return hasattr(value, "__aiter__")
+
+
+def _wrap_sync_stream(
+    stream: Any,
+    *,
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    output_type: str,
+    name: str,
+    call_event_id: str,
+    span_id: str,
+    upstream_ids: list[str],
+    upstream_refs: Any,
+    metadata: dict[str, Any] | None,
+    bp_metadata: dict[str, Any] | None,
+    timing: _StartedTiming,
+    dynamic_metadata: dict[str, Any],
+    track_output: bool,
+    provenance_mode: str | None,
+) -> Any:
+    def generator():
+        chunks: list[Any] = []
+        try:
+            with recorder.child_context(call_event_id, span_id):
+                for chunk in stream:
+                    chunks.append(chunk)
+                    yield chunk
+        except asyncio.CancelledError as exc:
+            _emit_output_event(
+                recorder,
+                output_type,
+                name,
+                call_event_id,
+                span_id,
+                upstream_ids,
+                upstream_refs,
+                output=safe_serialize(exc),
+                status=CANCELLED,
+                metadata=metadata,
+                bp_metadata=_metadata_with_exception(bp_metadata, exc, status=CANCELLED),
+                timing=timing.finish(),
+                dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks)},
+            )
+            raise
+        except Exception as exc:
+            status = _exception_status(exc)
+            _emit_output_event(
+                recorder,
+                output_type,
+                name,
+                call_event_id,
+                span_id,
+                upstream_ids,
+                upstream_refs,
+                output={"chunks": chunks, "error": safe_serialize(exc)},
+                status=status,
+                metadata=metadata,
+                bp_metadata=_metadata_with_exception(bp_metadata, exc, status=status),
+                timing=timing.finish(),
+                dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks), "partial": True},
+            )
+            raise
+        final_output: Any = chunks
+        output_event = _emit_output_event(
+            recorder,
+            output_type,
+            name,
+            call_event_id,
+            span_id,
+            upstream_ids,
+            upstream_refs,
+            output=final_output,
+            status=SUCCESS,
+            metadata=metadata,
+            bp_metadata=bp_metadata,
+            timing=timing.finish(),
+            dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks)},
+        )
+        if track_output:
+            tracker.attach(final_output, output_event, provenance_mode=provenance_mode)
+
+    return generator()
+
+
+def _wrap_async_stream(
+    stream: Any,
+    *,
+    recorder: Recorder,
+    tracker: ProvenanceTracker,
+    output_type: str,
+    name: str,
+    call_event_id: str,
+    span_id: str,
+    upstream_ids: list[str],
+    upstream_refs: Any,
+    metadata: dict[str, Any] | None,
+    bp_metadata: dict[str, Any] | None,
+    timing: _StartedTiming,
+    dynamic_metadata: dict[str, Any],
+    track_output: bool,
+    provenance_mode: str | None,
+) -> Any:
+    async def generator():
+        chunks: list[Any] = []
+        try:
+            with recorder.child_context(call_event_id, span_id):
+                async for chunk in stream:
+                    chunks.append(chunk)
+                    yield chunk
+        except asyncio.CancelledError as exc:
+            _emit_output_event(
+                recorder,
+                output_type,
+                name,
+                call_event_id,
+                span_id,
+                upstream_ids,
+                upstream_refs,
+                output=safe_serialize(exc),
+                status=CANCELLED,
+                metadata=metadata,
+                bp_metadata=_metadata_with_exception(bp_metadata, exc, status=CANCELLED),
+                timing=timing.finish(),
+                dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks)},
+            )
+            raise
+        except Exception as exc:
+            status = _exception_status(exc)
+            _emit_output_event(
+                recorder,
+                output_type,
+                name,
+                call_event_id,
+                span_id,
+                upstream_ids,
+                upstream_refs,
+                output={"chunks": chunks, "error": safe_serialize(exc)},
+                status=status,
+                metadata=metadata,
+                bp_metadata=_metadata_with_exception(bp_metadata, exc, status=status),
+                timing=timing.finish(),
+                dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks), "partial": True},
+            )
+            raise
+        final_output: Any = chunks
+        output_event = _emit_output_event(
+            recorder,
+            output_type,
+            name,
+            call_event_id,
+            span_id,
+            upstream_ids,
+            upstream_refs,
+            output=final_output,
+            status=SUCCESS,
+            metadata=metadata,
+            bp_metadata=bp_metadata,
+            timing=timing.finish(),
+            dynamic_metadata={**dynamic_metadata, "stream_chunks": len(chunks)},
+        )
+        if track_output:
+            tracker.attach(final_output, output_event, provenance_mode=provenance_mode)
+
+    return generator()
 
 
 def _event_metadata(
@@ -683,8 +1351,8 @@ def _event_metadata(
 
 def _split_reserved_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
     call_kwargs = dict(kwargs)
-    call_kwargs.pop("bp_input_refs", None)
-    call_kwargs.pop("bp_depends_on", None)
+    for key in RESERVED_KWARGS - {"bp_metadata", "bp_no_track"}:
+        call_kwargs.pop(key, None)
     bp_metadata = call_kwargs.pop("bp_metadata", None)
     no_track = bool(call_kwargs.pop("bp_no_track", False))
     return call_kwargs, bp_metadata if isinstance(bp_metadata, dict) else None, no_track
@@ -701,12 +1369,6 @@ def _merge_metadata(target: dict[str, Any], source: dict[str, Any] | None) -> No
             target["provenance"] = merged
         else:
             target[key] = value
-
-
-def _metadata_with_error(metadata: dict[str, Any] | None, exc: BaseException) -> dict[str, Any]:
-    event_metadata = dict(metadata or {})
-    _merge_metadata(event_metadata, error_metadata(exc))
-    return event_metadata
 
 
 def _unique_ids(event_ids: list[str]) -> list[str]:
@@ -794,7 +1456,34 @@ def _state_metadata(
 
 def _llm_metadata(kwargs: dict[str, Any]) -> dict[str, Any]:
     metadata = {}
-    for key in ("model", "temperature", "tool_choice", "response_format"):
+    for key in ("model", "temperature", "tool_choice", "response_format", "stream", "streaming"):
         if key in kwargs:
             metadata[key] = kwargs[key]
+    if _metadata_streaming(metadata):
+        metadata["streaming"] = True
+        metadata["stream_recording_strategy"] = "single_call_final_output"
     return metadata
+
+
+def _llm_output_metadata(
+    call_kwargs: dict[str, Any],
+    static_metadata: dict[str, Any] | None,
+    bp_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    metadata = _llm_metadata(call_kwargs)
+    if isinstance(static_metadata, dict):
+        for key in ("stream", "streaming"):
+            if key in static_metadata:
+                metadata[key] = static_metadata[key]
+    if isinstance(bp_metadata, dict):
+        for key in ("stream", "streaming"):
+            if key in bp_metadata:
+                metadata[key] = bp_metadata[key]
+    if _metadata_streaming(metadata):
+        metadata["streaming"] = True
+        metadata["stream_recording_strategy"] = "single_call_final_output"
+    return metadata
+
+
+def _metadata_streaming(metadata: dict[str, Any]) -> bool:
+    return bool(metadata.get("streaming") or metadata.get("stream"))

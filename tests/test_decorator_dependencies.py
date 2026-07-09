@@ -4,6 +4,14 @@ import pytest
 
 from branchpoint import BranchPoint
 from branchpoint.core.schema import ERROR, LLM_CALL, LLM_OUTPUT, MEMORY_READ, MEMORY_WRITE, TOOL_CALL, TOOL_OUTPUT
+from branchpoint.core.schema import (
+    CANCELLED,
+    HANDOFF,
+    RETRY,
+    ROUTING_DECISION,
+    TIMEOUT,
+    VALIDATION_CHECK,
+)
 
 
 def test_decorator_auto_dependency(tmp_path):
@@ -355,6 +363,138 @@ def test_tracker_state_clears_at_trace_end(tmp_path):
         assert bp.refs(value)
 
     assert bp.refs(value) == []
+
+
+def test_phase06_single_event_decorators_record_timing_and_dependencies(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.validation("check_payload")
+    def check_payload(payload):
+        return {"valid": payload["ok"]}
+
+    @bp.route("select_route")
+    def select_route(validation):
+        return "refund" if validation["valid"] else "manual"
+
+    @bp.handoff("handoff_to_refunds")
+    def handoff_to_refunds(route, *, bp_metadata=None):
+        return {"team": route}
+
+    @bp.retry("retry_lookup")
+    def retry_lookup(route):
+        return {"route": route, "attempt": 2}
+
+    with bp.trace("run") as trace:
+        validation = check_payload({"ok": True})
+        route = select_route(validation)
+        handoff_to_refunds(route, bp_metadata={"owner": "tests"})
+        retry_lookup(route)
+
+    events = bp.store.list_events(trace.run_id)
+    validation_event = _event(events, VALIDATION_CHECK, "check_payload")
+    route_event = _event(events, ROUTING_DECISION, "select_route")
+    handoff_event = _event(events, HANDOFF, "handoff_to_refunds")
+    retry_event = _event(events, RETRY, "retry_lookup")
+
+    assert route_event.input_refs == [validation_event.event_id]
+    assert "bp_metadata" not in handoff_event.input["kwargs"]
+    assert handoff_event.metadata["owner"] == "tests"
+    assert validation_event.metadata["operation"] == "validation"
+    assert route_event.metadata["operation"] == "route"
+    assert handoff_event.metadata["operation"] == "handoff"
+    assert retry_event.metadata["operation"] == "retry"
+    for event in (validation_event, route_event, handoff_event, retry_event):
+        assert isinstance(event.metadata["latency_ms"], float)
+        assert event.metadata["timestamp_start"]
+        assert event.metadata["timestamp_end"]
+        assert event.timestamp_end == event.metadata["timestamp_end"]
+
+
+def test_timeout_exception_records_timeout_status_and_reraises(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("timeout")
+    def timeout():
+        raise TimeoutError("deadline exceeded")
+
+    with pytest.raises(TimeoutError):
+        with bp.trace("run") as trace:
+            timeout()
+
+    output = _event(bp.store.list_events(trace.run_id), TOOL_OUTPUT, "timeout")
+
+    assert output.status == TIMEOUT
+    assert output.metadata["timeout"] is True
+    assert output.metadata["error_type"] == "TimeoutError"
+    assert output.metadata["latency_ms"] >= 0
+
+
+def test_async_cancelled_error_records_cancelled_and_reraises(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("cancel")
+    async def cancel():
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        with bp.trace("run") as trace:
+            asyncio.run(cancel())
+
+    run = bp.store.get_run(trace.run_id)
+    output = _event(bp.store.list_events(trace.run_id), TOOL_OUTPUT, "cancel")
+
+    assert run.status == CANCELLED
+    assert output.status == CANCELLED
+    assert output.metadata["cancelled"] is True
+
+
+def test_streaming_llm_records_one_call_and_final_output(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.llm("stream_answer")
+    def stream_answer(*, stream=False):
+        yield "hello"
+        yield " world"
+
+    with bp.trace("run") as trace:
+        chunks = list(stream_answer(stream=True))
+
+    events = bp.store.list_events(trace.run_id)
+    call = _event(events, LLM_CALL, "stream_answer")
+    output = _event(events, LLM_OUTPUT, "stream_answer")
+
+    assert chunks == ["hello", " world"]
+    assert [event.type for event in events] == [LLM_CALL, LLM_OUTPUT]
+    assert output.parent_id == call.event_id
+    assert output.output == ["hello", " world"]
+    assert output.metadata["streaming"] is True
+    assert output.metadata["stream_recording_strategy"] == "single_call_final_output"
+    assert output.metadata["stream_chunks"] == 2
+
+
+def test_async_concurrent_traces_keep_context_isolated(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    @bp.tool("lookup")
+    async def lookup(label):
+        await asyncio.sleep(0)
+        return {"label": label}
+
+    async def run_one(label):
+        with bp.trace(label) as trace:
+            await lookup(label)
+            return trace.run_id
+
+    async def run_all():
+        return await asyncio.gather(run_one("a"), run_one("b"))
+
+    first_run_id, second_run_id = asyncio.run(run_all())
+
+    assert first_run_id != second_run_id
+    for run_id in (first_run_id, second_run_id):
+        events = bp.store.list_events(run_id)
+        assert {event.run_id for event in events} == {run_id}
+        assert [event.type for event in events] == [TOOL_CALL, TOOL_OUTPUT]
 
 
 def _event(events, event_type, name):

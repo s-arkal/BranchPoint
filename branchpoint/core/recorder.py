@@ -139,6 +139,8 @@ class Recorder:
         metadata: dict[str, Any] | None = None,
         parent_id: str | None = None,
         span_id: str | None = None,
+        timestamp_start: str | None = None,
+        timestamp_end: str | None = None,
         run_id: str | None = None,
         project_id: str | None = None,
     ) -> TraceEvent:
@@ -170,7 +172,8 @@ class Recorder:
             name=name,
             parent_id=parent_id if parent_id is not None else get_current_parent_event_id(),
             span_id=span_id if span_id is not None else get_current_span_id(),
-            timestamp_start=utc_now_iso(),
+            timestamp_start=timestamp_start or utc_now_iso(),
+            timestamp_end=timestamp_end,
             input=input,
             output=output,
             input_refs=list(input_refs or []),
