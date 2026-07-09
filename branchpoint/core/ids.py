@@ -19,3 +19,7 @@ def new_span_id() -> str:
 
 def new_edge_id() -> str:
     return f"edge_{uuid.uuid4().hex}"
+
+
+def new_snapshot_id() -> str:
+    return f"snap_{uuid.uuid4().hex}"

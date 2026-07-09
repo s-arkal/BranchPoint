@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from branchpoint.core.context import get_current_run_id, reset_dependency_refs, set_dependency_refs
+from branchpoint.core.context import get_current_project_id, get_current_run_id, reset_dependency_refs, set_dependency_refs
 from branchpoint.core.errors import EventContractError, NoActiveTraceError, TraceNotFoundError
 from branchpoint.core.graph_builder import GraphBuilder
 from branchpoint.core.graph_types import (
@@ -20,6 +20,7 @@ from branchpoint.core.graph_types import (
     validate_edge_source_kind,
     validate_edge_weight,
 )
+from branchpoint.core.ids import new_snapshot_id
 from branchpoint.core.provenance import ProvenanceTracker
 from branchpoint.core.recorder import Recorder
 from branchpoint.core.refs import ProvenanceRef, collect_input_refs, refs_to_dicts
@@ -30,13 +31,22 @@ from branchpoint.core.schema import (
     METADATA_STATE_NAME,
     METADATA_STATE_PATH,
     METADATA_VALUE_HASH,
+    SNAPSHOT_CUSTOM,
     STATE_READ,
     STATE_WRITE,
     SUCCESS,
+    Snapshot,
     canonical_state_name,
     canonical_state_path,
+    validate_snapshot_kind,
 )
 from branchpoint.core.serialization import safe_serialize
+from branchpoint.core.snapshots import (
+    diff_json_like,
+    link_snapshot_metadata,
+    prepare_snapshot_payload,
+    verify_snapshot_payload,
+)
 from branchpoint.storage.blob_store import BlobStore
 from branchpoint.storage.sqlite_store import SQLiteEventStore
 from .decorators import (
@@ -188,6 +198,87 @@ class BranchPoint:
             status=status,
             metadata=event_metadata,
         )
+
+    def snapshot(
+        self,
+        *,
+        kind: str = SNAPSHOT_CUSTOM,
+        payload: Any,
+        name: str | None = None,
+        event_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        project_id: str | None = None,
+    ) -> Snapshot:
+        validate_snapshot_kind(kind)
+        active_run_id = get_current_run_id()
+        active_project_id = get_current_project_id()
+        resolved_run_id = run_id or active_run_id
+        if resolved_run_id is None:
+            raise NoActiveTraceError("snapshot requires an active trace or explicit run_id")
+        if active_run_id is not None and run_id is not None and run_id != active_run_id:
+            raise EventContractError("snapshot run_id cannot differ from the active trace run_id")
+        if active_project_id is not None and project_id is not None and project_id != active_project_id:
+            raise EventContractError("snapshot project_id cannot differ from the active trace project_id")
+
+        run = self.store.get_run(resolved_run_id)
+        if run is None:
+            raise TraceNotFoundError(f"BranchPoint run {resolved_run_id!r} does not exist")
+
+        event = None
+        if event_id is not None:
+            events_by_id = {event.event_id: event for event in self.store.list_events(resolved_run_id)}
+            event = events_by_id.get(event_id)
+            if event is None:
+                raise EventContractError(
+                    f"BranchPoint snapshot event_id must belong to run {resolved_run_id!r}: {event_id!r}"
+                )
+
+        resolved_project_id = project_id or (event.project_id if event is not None else active_project_id) or run.project_id
+        snapshot = Snapshot(
+            snapshot_id=new_snapshot_id(),
+            run_id=resolved_run_id,
+            event_id=event_id,
+            project_id=resolved_project_id,
+            kind=kind,
+            name=name,
+            payload=payload,
+            metadata=safe_serialize(metadata or {}),
+        )
+        prepare_snapshot_payload(snapshot, self.blob_store)
+        self.store.append_snapshot(snapshot)
+
+        if event is not None:
+            self.store.update_event_metadata(event.event_id, link_snapshot_metadata(event.metadata, snapshot))
+
+        return snapshot
+
+    def get_snapshot(self, snapshot_id: str) -> Snapshot | None:
+        return self.store.get_snapshot(snapshot_id)
+
+    def list_snapshots(
+        self,
+        run_id: str | None = None,
+        *,
+        event_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Snapshot]:
+        resolved_run_id = run_id or get_current_run_id()
+        if resolved_run_id is None:
+            raise NoActiveTraceError("list_snapshots requires an active trace or explicit run_id")
+        return self.store.list_snapshots(resolved_run_id, event_id=event_id, kind=kind)
+
+    def snapshot_payload(self, snapshot: Snapshot | str) -> Any:
+        resolved_snapshot = self.store.get_snapshot(snapshot) if isinstance(snapshot, str) else snapshot
+        if resolved_snapshot is None:
+            raise TraceNotFoundError(f"BranchPoint snapshot {snapshot!r} does not exist")
+        payload = resolved_snapshot.payload
+        if payload is None and resolved_snapshot.payload_ref is not None:
+            payload = self.blob_store.get_json(resolved_snapshot.payload_ref)
+        return verify_snapshot_payload(resolved_snapshot, payload)
+
+    def diff(self, before: Any, after: Any) -> list[dict[str, Any]]:
+        return diff_json_like(before, after)
 
     def edge(
         self,

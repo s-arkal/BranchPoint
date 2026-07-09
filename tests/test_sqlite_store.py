@@ -1,8 +1,17 @@
 import sqlite3
 
 from branchpoint.core.graph_types import GraphEdge
-from branchpoint.core.ids import new_event_id, new_run_id
-from branchpoint.core.schema import SCHEMA_VERSION, SUCCESS, TraceEvent, TraceRun, USER_REQUEST, utc_now_iso
+from branchpoint.core.ids import new_event_id, new_run_id, new_snapshot_id
+from branchpoint.core.schema import (
+    SCHEMA_VERSION,
+    SNAPSHOT_CUSTOM,
+    SUCCESS,
+    Snapshot,
+    TraceEvent,
+    TraceRun,
+    USER_REQUEST,
+    utc_now_iso,
+)
 from branchpoint.storage.sqlite_store import SQLiteEventStore
 
 
@@ -24,10 +33,21 @@ def test_sqlite_store_persists_runs_events_edges_and_schema_indexes(tmp_path):
         target_event_id=event.event_id,
         edge_type="controlflow",
     )
+    snapshot = Snapshot(
+        snapshot_id=new_snapshot_id(),
+        run_id=run.run_id,
+        event_id=event.event_id,
+        project_id=run.project_id,
+        kind=SNAPSHOT_CUSTOM,
+        payload={"query": "hello"},
+        payload_hash="hash_test",
+        preview={"query": "hello"},
+    )
 
     store.create_run(run)
     store.append_event(event)
     store.append_edge(edge)
+    store.append_snapshot(snapshot)
     store.finish_run(run.run_id, SUCCESS)
 
     assert store.get_run(run.run_id).status == SUCCESS
@@ -36,17 +56,24 @@ def test_sqlite_store_persists_runs_events_edges_and_schema_indexes(tmp_path):
     assert store.list_events(run.run_id)[0].schema_version == SCHEMA_VERSION
     assert store.list_edges(run.run_id)[0].edge_type == "controlflow"
     assert store.list_edges(run.run_id)[0].schema_version == SCHEMA_VERSION
+    assert store.get_snapshot(snapshot.snapshot_id).payload == {"query": "hello"}
+    assert store.get_snapshot(snapshot.snapshot_id).schema_version == SCHEMA_VERSION
+    assert store.list_snapshots(run.run_id, event_id=event.event_id, kind=SNAPSHOT_CUSTOM)[0].snapshot_id == snapshot.snapshot_id
 
     with sqlite3.connect(db_path) as conn:
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
         event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
         edge_columns = {row[1] for row in conn.execute("PRAGMA table_info(graph_edges)").fetchall()}
+        snapshot_columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
         indexes = {row[1] for row in conn.execute("PRAGMA index_list(events)").fetchall()}
+        snapshot_indexes = {row[1] for row in conn.execute("PRAGMA index_list(snapshots)").fetchall()}
 
     assert "schema_version" in run_columns
     assert {"schema_version", "input_json", "output_json", "input_payload_ref", "output_hash"} <= event_columns
     assert "schema_version" in edge_columns
+    assert {"schema_version", "payload_json", "payload_ref", "payload_hash", "preview_json"} <= snapshot_columns
     assert {"idx_events_run_id", "idx_events_type", "idx_events_parent_id"} <= indexes
+    assert {"idx_snapshots_run_id", "idx_snapshots_event_id", "idx_snapshots_kind"} <= snapshot_indexes
 
 
 def test_sqlite_store_hydrates_old_rows_without_schema_version(tmp_path):

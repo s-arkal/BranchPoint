@@ -22,9 +22,34 @@ from .context import (
 )
 from .errors import EventContractError, NoActiveTraceError
 from .event_store import EventStore
-from .ids import new_event_id, new_run_id, new_span_id
+from .ids import new_event_id, new_run_id, new_snapshot_id, new_span_id
 from .provenance import ProvenanceTracker
-from .schema import CANCELLED, ERROR, RUNNING, SUCCESS, TraceEvent, TraceRun, validate_event_contract, utc_now_iso
+from .schema import (
+    CANCELLED,
+    ERROR,
+    LLM_CALL,
+    LLM_OUTPUT,
+    METADATA_STATE_NAME,
+    METADATA_STATE_PATH,
+    RETRIEVAL_RESULT,
+    RUNNING,
+    SNAPSHOT_LLM_PROMPT,
+    SNAPSHOT_LLM_RESPONSE,
+    SNAPSHOT_RETRIEVAL_RESULT,
+    SNAPSHOT_STATE_AFTER,
+    SNAPSHOT_STATE_BEFORE,
+    SNAPSHOT_STATE_DIFF,
+    SNAPSHOT_TOOL_OUTPUT,
+    STATE_WRITE,
+    SUCCESS,
+    TOOL_OUTPUT,
+    Snapshot,
+    TraceEvent,
+    TraceRun,
+    validate_event_contract,
+    utc_now_iso,
+)
+from .snapshots import diff_json_like, link_snapshot_metadata, prepare_snapshot_payload
 from .serialization import safe_serialize
 from branchpoint.storage.blob_store import BlobStore
 
@@ -142,8 +167,13 @@ class Recorder:
             status=status,
             metadata=event_metadata,
         )
+        snapshots = self._automatic_snapshots_for_event(event)
+        for snapshot in snapshots:
+            event.metadata = link_snapshot_metadata(event.metadata, snapshot)
         self._prepare_payloads(event)
         self.store.append_event(event)
+        for snapshot in snapshots:
+            self.store.append_snapshot(snapshot)
         return event
 
     def _prepare_payloads(self, event: TraceEvent) -> None:
@@ -157,6 +187,45 @@ class Recorder:
             if self.blob_store.should_externalize(event.output):
                 event.output_payload_ref = self.blob_store.put_json(event.run_id, event.event_id, "output", event.output)
                 event.output = None
+
+    def _automatic_snapshots_for_event(self, event: TraceEvent) -> list[Snapshot]:
+        snapshots: list[Snapshot] = []
+
+        def add_snapshot(kind: str, payload: Any, *, name_suffix: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+            snapshot = Snapshot(
+                snapshot_id=new_snapshot_id(),
+                run_id=event.run_id,
+                event_id=event.event_id,
+                project_id=event.project_id,
+                kind=kind,
+                name=_snapshot_name(event.name, name_suffix),
+                payload=payload,
+                metadata={
+                    "automatic": True,
+                    "source_event_type": event.type,
+                    **(metadata or {}),
+                },
+            )
+            prepare_snapshot_payload(snapshot, self.blob_store)
+            snapshots.append(snapshot)
+
+        if event.type == TOOL_OUTPUT and event.output is not None:
+            add_snapshot(SNAPSHOT_TOOL_OUTPUT, event.output)
+        elif event.type == RETRIEVAL_RESULT and event.output is not None:
+            add_snapshot(SNAPSHOT_RETRIEVAL_RESULT, event.output)
+        elif event.type == LLM_CALL and event.input is not None:
+            add_snapshot(SNAPSHOT_LLM_PROMPT, event.input)
+        elif event.type == LLM_OUTPUT and event.output is not None:
+            add_snapshot(SNAPSHOT_LLM_RESPONSE, event.output)
+        elif event.type == STATE_WRITE:
+            state_metadata = _state_snapshot_metadata(event)
+            before = event.input.get("before") if isinstance(event.input, dict) else None
+            after = event.output
+            add_snapshot(SNAPSHOT_STATE_BEFORE, before, name_suffix="before", metadata=state_metadata)
+            add_snapshot(SNAPSHOT_STATE_AFTER, after, name_suffix="after", metadata=state_metadata)
+            add_snapshot(SNAPSHOT_STATE_DIFF, diff_json_like(before, after), name_suffix="diff", metadata=state_metadata)
+
+        return snapshots
 
     def child_context(self, parent_id: str, span_id: str):
         return _ChildContext(parent_id=parent_id, span_id=span_id)
@@ -184,6 +253,25 @@ class _ChildContext:
 def _hash_json(value: Any) -> str:
     payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _snapshot_name(event_name: str | None, suffix: str | None) -> str | None:
+    if event_name is None:
+        return suffix
+    if suffix is None:
+        return event_name
+    return f"{event_name}.{suffix}"
+
+
+def _state_snapshot_metadata(event: TraceEvent) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    state_name = event.metadata.get(METADATA_STATE_NAME)
+    state_path = event.metadata.get(METADATA_STATE_PATH)
+    if state_name is not None:
+        metadata[METADATA_STATE_NAME] = state_name
+    if state_path is not None:
+        metadata[METADATA_STATE_PATH] = state_path
+    return metadata
 
 
 def new_recording_span_id() -> str:

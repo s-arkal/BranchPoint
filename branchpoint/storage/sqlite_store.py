@@ -11,10 +11,12 @@ from branchpoint.core.graph_types import GraphEdge
 from branchpoint.core.schema import (
     RUNNING,
     SCHEMA_VERSION,
+    Snapshot,
     TraceEvent,
     TraceRun,
     validate_event_contract,
     validate_schema_version,
+    validate_snapshot_kind,
     validate_status,
 )
 from branchpoint.core.serialization import safe_serialize
@@ -93,15 +95,40 @@ class SQLiteEventStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    event_id TEXT,
+                    project_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
+                    kind TEXT NOT NULL,
+                    name TEXT,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT,
+                    payload_ref TEXT,
+                    payload_hash TEXT,
+                    preview_json TEXT,
+                    metadata_json TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(event_id) REFERENCES events(event_id)
+                )
+                """
+            )
             self._ensure_column(conn, "runs", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
             self._ensure_column(conn, "events", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
             self._ensure_column(conn, "graph_edges", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
+            self._ensure_column(conn, "snapshots", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_parent_id ON events(parent_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_run_id ON graph_edges(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON graph_edges(source_event_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target_event_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_run_id ON snapshots(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_event_id ON snapshots(event_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_kind ON snapshots(kind)")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -204,6 +231,13 @@ class SQLiteEventStore:
             ).fetchall()
         return [_event_from_row(row) for row in rows]
 
+    def update_event_metadata(self, event_id: str, metadata: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE events SET metadata_json = ? WHERE event_id = ?",
+                (_json(metadata), event_id),
+            )
+
     def append_edge(self, edge: GraphEdge) -> None:
         validate_schema_version(edge.schema_version)
         with self._connect() as conn:
@@ -236,6 +270,65 @@ class SQLiteEventStore:
                 (run_id,),
             ).fetchall()
         return [_edge_from_row(row) for row in rows]
+
+    def append_snapshot(self, snapshot: Snapshot) -> None:
+        validate_schema_version(snapshot.schema_version)
+        validate_snapshot_kind(snapshot.kind)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    snapshot_id, run_id, event_id, project_id, schema_version, kind,
+                    name, timestamp, payload_json, payload_ref, payload_hash,
+                    preview_json, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.snapshot_id,
+                    snapshot.run_id,
+                    snapshot.event_id,
+                    snapshot.project_id,
+                    snapshot.schema_version,
+                    snapshot.kind,
+                    snapshot.name,
+                    snapshot.timestamp,
+                    _json_or_none(snapshot.payload),
+                    snapshot.payload_ref,
+                    snapshot.payload_hash,
+                    _json_or_none(snapshot.preview),
+                    _json(snapshot.metadata),
+                ),
+            )
+
+    def get_snapshot(self, snapshot_id: str) -> Snapshot | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+        return _snapshot_from_row(row) if row else None
+
+    def list_snapshots(
+        self,
+        run_id: str,
+        *,
+        event_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Snapshot]:
+        conditions = ["run_id = ?"]
+        values: list[object] = [run_id]
+        if event_id is not None:
+            conditions.append("event_id = ?")
+            values.append(event_id)
+        if kind is not None:
+            validate_snapshot_kind(kind)
+            conditions.append("kind = ?")
+            values.append(kind)
+        where_clause = " AND ".join(conditions)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM snapshots WHERE {where_clause} ORDER BY timestamp ASC, snapshot_id ASC",
+                values,
+            ).fetchall()
+        return [_snapshot_from_row(row) for row in rows]
 
 
 def _json(value: object) -> str:
@@ -300,5 +393,23 @@ def _edge_from_row(row: sqlite3.Row) -> GraphEdge:
         weight=row["weight"],
         confidence=row["confidence"],
         reason=row["reason"],
+        metadata=dict(_loads(row["metadata_json"], {})),
+    )
+
+
+def _snapshot_from_row(row: sqlite3.Row) -> Snapshot:
+    return Snapshot(
+        snapshot_id=row["snapshot_id"],
+        run_id=row["run_id"],
+        event_id=row["event_id"],
+        project_id=row["project_id"],
+        kind=row["kind"],
+        schema_version=row["schema_version"] or SCHEMA_VERSION,
+        name=row["name"],
+        timestamp=row["timestamp"],
+        payload=_loads(row["payload_json"], None),
+        payload_ref=row["payload_ref"],
+        payload_hash=row["payload_hash"],
+        preview=_loads(row["preview_json"], None),
         metadata=dict(_loads(row["metadata_json"], {})),
     )

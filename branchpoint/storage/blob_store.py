@@ -23,6 +23,14 @@ class BlobStore:
         path.write_text(json.dumps(safe_value, sort_keys=True), encoding="utf-8")
         return str(path.relative_to(self.root))
 
+    def put_snapshot_json(self, run_id: str, snapshot_id: str, value: Any) -> str:
+        safe_value = safe_serialize(value)
+        directory = self.root / "runs" / run_id / "snapshots"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{snapshot_id}.json"
+        path.write_text(json.dumps(safe_value, sort_keys=True), encoding="utf-8")
+        return str(path.relative_to(self.root))
+
     def get_json(self, ref: str) -> Any:
         return json.loads((self.root / ref).read_text(encoding="utf-8"))
 

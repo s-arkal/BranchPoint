@@ -87,6 +87,8 @@ METADATA_STATE_PATH = "state_path"
 METADATA_BEFORE_HASH = "before_hash"
 METADATA_AFTER_HASH = "after_hash"
 METADATA_VALUE_HASH = "value_hash"
+METADATA_SNAPSHOT_IDS = "snapshot_ids"
+METADATA_SNAPSHOTS = "snapshots"
 
 STANDARD_METADATA_KEYS = {
     METADATA_CUSTOM_TYPE,
@@ -101,6 +103,34 @@ STANDARD_METADATA_KEYS = {
     METADATA_BEFORE_HASH,
     METADATA_AFTER_HASH,
     METADATA_VALUE_HASH,
+    METADATA_SNAPSHOT_IDS,
+    METADATA_SNAPSHOTS,
+}
+
+SNAPSHOT_MEMORY_BEFORE = "memory_before"
+SNAPSHOT_MEMORY_AFTER = "memory_after"
+SNAPSHOT_STATE_BEFORE = "state_before"
+SNAPSHOT_STATE_AFTER = "state_after"
+SNAPSHOT_STATE_DIFF = "state_diff"
+SNAPSHOT_TOOL_OUTPUT = "tool_output"
+SNAPSHOT_RETRIEVAL_RESULT = "retrieval_result"
+SNAPSHOT_LLM_PROMPT = "llm_prompt"
+SNAPSHOT_LLM_RESPONSE = "llm_response"
+SNAPSHOT_VALIDATION_RESULT = "validation_result"
+SNAPSHOT_CUSTOM = "custom"
+
+SNAPSHOT_KINDS = {
+    SNAPSHOT_MEMORY_BEFORE,
+    SNAPSHOT_MEMORY_AFTER,
+    SNAPSHOT_STATE_BEFORE,
+    SNAPSHOT_STATE_AFTER,
+    SNAPSHOT_STATE_DIFF,
+    SNAPSHOT_TOOL_OUTPUT,
+    SNAPSHOT_RETRIEVAL_RESULT,
+    SNAPSHOT_LLM_PROMPT,
+    SNAPSHOT_LLM_RESPONSE,
+    SNAPSHOT_VALIDATION_RESULT,
+    SNAPSHOT_CUSTOM,
 }
 
 
@@ -119,6 +149,12 @@ def validate_status(status: str) -> None:
     if status not in STATUS_VALUES:
         allowed = ", ".join(sorted(STATUS_VALUES))
         raise EventContractError(f"Invalid BranchPoint status {status!r}; expected one of: {allowed}")
+
+
+def validate_snapshot_kind(kind: str) -> None:
+    if kind not in SNAPSHOT_KINDS:
+        allowed = ", ".join(sorted(SNAPSHOT_KINDS))
+        raise EventContractError(f"Invalid BranchPoint snapshot kind {kind!r}; expected one of: {allowed}")
 
 
 def validate_event_type(event_type: str, metadata: dict[str, Any] | None = None, *, strict: bool = True) -> None:
@@ -270,3 +306,26 @@ class TraceRun:
     def __post_init__(self) -> None:
         self.schema_version = validate_schema_version(self.schema_version)
         validate_status(self.status)
+
+
+@dataclass
+class Snapshot:
+    snapshot_id: str
+    run_id: str
+    project_id: str
+    kind: str
+    event_id: Optional[str] = None
+    schema_version: str = SCHEMA_VERSION
+    name: Optional[str] = None
+    timestamp: str = ""
+    payload: Any = None
+    payload_ref: Optional[str] = None
+    payload_hash: Optional[str] = None
+    preview: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.schema_version = validate_schema_version(self.schema_version)
+        validate_snapshot_kind(self.kind)
+        if not self.timestamp:
+            self.timestamp = utc_now_iso()

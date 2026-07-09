@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from .graph_types import GraphEdge
-from .schema import TraceEvent, TraceRun
+from .schema import Snapshot, TraceEvent, TraceRun
 
 
 class EventStore(Protocol):
@@ -27,8 +27,26 @@ class EventStore(Protocol):
     def list_events(self, run_id: str) -> list[TraceEvent]:
         ...
 
+    def update_event_metadata(self, event_id: str, metadata: dict) -> None:
+        ...
+
     def append_edge(self, edge: GraphEdge) -> None:
         ...
 
     def list_edges(self, run_id: str) -> list[GraphEdge]:
+        ...
+
+    def append_snapshot(self, snapshot: Snapshot) -> None:
+        ...
+
+    def get_snapshot(self, snapshot_id: str) -> Snapshot | None:
+        ...
+
+    def list_snapshots(
+        self,
+        run_id: str,
+        *,
+        event_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Snapshot]:
         ...
