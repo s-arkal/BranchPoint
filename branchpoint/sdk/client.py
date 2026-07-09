@@ -50,13 +50,17 @@ from branchpoint.core.snapshots import (
 from branchpoint.storage.blob_store import BlobStore
 from branchpoint.storage.sqlite_store import SQLiteEventStore
 from .decorators import (
+    handoff_decorator,
     llm_decorator,
     memory_read_decorator,
     memory_write_decorator,
+    retry_decorator,
     retrieval_decorator,
+    route_decorator,
     state_read_decorator,
     state_write_decorator,
     tool_decorator,
+    validation_decorator,
 )
 from .prompt import BranchPointPrompt
 
@@ -603,6 +607,90 @@ class BranchPoint:
         metadata: dict[str, Any] | None = None,
     ):
         return retrieval_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
+    def validation(
+        self,
+        name: str | None = None,
+        *,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return validation_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
+    def route(
+        self,
+        name: str | None = None,
+        *,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return route_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
+    def handoff(
+        self,
+        name: str | None = None,
+        *,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return handoff_decorator(
+            self.recorder,
+            self.provenance_tracker,
+            name=name,
+            exclude_args=exclude_args,
+            exclude_kwargs=exclude_kwargs,
+            track_output=track_output,
+            provenance_mode=provenance_mode,
+            metadata=metadata,
+        )
+
+    def retry(
+        self,
+        name: str | None = None,
+        *,
+        exclude_args: list[int] | None = None,
+        exclude_kwargs: list[str] | None = None,
+        track_output: bool = True,
+        provenance_mode: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        return retry_decorator(
             self.recorder,
             self.provenance_tracker,
             name=name,
