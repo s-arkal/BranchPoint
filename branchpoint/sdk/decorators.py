@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import functools
 import inspect
 from typing import Any, Callable, TypeVar
@@ -498,6 +496,7 @@ def _state_event(
                         status=ERROR,
                         metadata=_metadata_with_error(
                             _state_metadata(
+                                recorder,
                                 metadata,
                                 operation,
                                 resolved_state_name,
@@ -519,6 +518,7 @@ def _state_event(
                     input_refs=upstream_ids,
                     status=SUCCESS,
                     metadata=_state_metadata(
+                        recorder,
                         metadata,
                         operation,
                         resolved_state_name,
@@ -559,6 +559,7 @@ def _state_event(
                     status=ERROR,
                     metadata=_metadata_with_error(
                         _state_metadata(
+                            recorder,
                             metadata,
                             operation,
                             resolved_state_name,
@@ -580,6 +581,7 @@ def _state_event(
                 input_refs=upstream_ids,
                 status=SUCCESS,
                 metadata=_state_metadata(
+                    recorder,
                     metadata,
                     operation,
                     resolved_state_name,
@@ -766,6 +768,7 @@ def _state_input_payload(
 
 
 def _state_metadata(
+    recorder: Recorder,
     static_metadata: dict[str, Any] | None,
     operation: str,
     state_name: str,
@@ -782,16 +785,11 @@ def _state_metadata(
         "state_path": state_path,
     }
     if operation == "read":
-        dynamic_metadata["value_hash"] = _hash_state_value(result)
+        dynamic_metadata["value_hash"] = recorder.hash_payload(result)
     else:
-        dynamic_metadata["before_hash"] = _hash_state_value(call_kwargs.get("before"))
-        dynamic_metadata["after_hash"] = _hash_state_value(result)
+        dynamic_metadata["before_hash"] = recorder.hash_payload(call_kwargs.get("before"))
+        dynamic_metadata["after_hash"] = recorder.hash_payload(result)
     return _event_metadata(static_metadata, dynamic_metadata, input_refs, bp_metadata)
-
-
-def _hash_state_value(value: Any) -> str:
-    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _llm_metadata(kwargs: dict[str, Any]) -> dict[str, Any]:

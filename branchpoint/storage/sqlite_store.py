@@ -19,13 +19,20 @@ from branchpoint.core.schema import (
     validate_snapshot_kind,
     validate_status,
 )
-from branchpoint.core.serialization import safe_serialize
+from branchpoint.core.serialization import RedactionConfig, canonical_serialize_for_hash, safe_serialize_for_storage
 
 
 class SQLiteEventStore:
-    def __init__(self, db_path: str | Path = ".branchpoint/branchpoint.sqlite", *, strict_event_types: bool = True) -> None:
+    def __init__(
+        self,
+        db_path: str | Path = ".branchpoint/branchpoint.sqlite",
+        *,
+        strict_event_types: bool = True,
+        redaction_config: RedactionConfig | None = None,
+    ) -> None:
         self.db_path = Path(db_path)
         self.strict_event_types = strict_event_types
+        self.redaction_config = redaction_config or RedactionConfig.from_rules()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -157,7 +164,7 @@ class SQLiteEventStore:
                     run.started_at,
                     run.ended_at,
                     run.failure_label,
-                    _json(run.metadata),
+                    self._json(run.metadata),
                 ),
             )
 
@@ -211,11 +218,11 @@ class SQLiteEventStore:
                     event.timestamp_start,
                     event.timestamp_end,
                     event.status,
-                    _json_or_none(event.input),
-                    _json_or_none(event.output),
-                    _json(event.input_refs),
-                    _json(event.output_refs),
-                    _json(event.metadata),
+                    self._json_or_none(event.input),
+                    self._json_or_none(event.output),
+                    self._json(event.input_refs),
+                    self._json(event.output_refs),
+                    self._json(event.metadata),
                     event.input_payload_ref,
                     event.output_payload_ref,
                     event.input_hash,
@@ -235,7 +242,7 @@ class SQLiteEventStore:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE events SET metadata_json = ? WHERE event_id = ?",
-                (_json(metadata), event_id),
+                (self._json(metadata), event_id),
             )
 
     def append_edge(self, edge: GraphEdge) -> None:
@@ -259,7 +266,7 @@ class SQLiteEventStore:
                     edge.weight,
                     edge.confidence,
                     edge.reason,
-                    _json(edge.metadata),
+                    self._json(edge.metadata),
                 ),
             )
 
@@ -293,11 +300,11 @@ class SQLiteEventStore:
                     snapshot.kind,
                     snapshot.name,
                     snapshot.timestamp,
-                    _json_or_none(snapshot.payload),
+                    self._json_or_none(snapshot.payload),
                     snapshot.payload_ref,
                     snapshot.payload_hash,
-                    _json_or_none(snapshot.preview),
-                    _json(snapshot.metadata),
+                    self._json_or_none(snapshot.preview),
+                    self._json(snapshot.metadata),
                 ),
             )
 
@@ -330,13 +337,56 @@ class SQLiteEventStore:
             ).fetchall()
         return [_snapshot_from_row(row) for row in rows]
 
+    def _json(self, value: object) -> str:
+        return canonical_serialize_for_hash(safe_serialize_for_storage(value, redaction_config=self.redaction_config).value)
 
-def _json(value: object) -> str:
-    return json.dumps(safe_serialize(value), sort_keys=True)
+    def _json_or_none(self, value: object) -> str | None:
+        return None if value is None else self._json(value)
 
+    def cleanup_runs_before(self, cutoff_iso: str) -> dict[str, object]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE status != ? AND COALESCE(ended_at, started_at) < ?
+                ORDER BY started_at ASC
+                """,
+                (RUNNING, cutoff_iso),
+            ).fetchall()
+            run_ids = [row["run_id"] for row in rows]
+            if not run_ids:
+                return {
+                    "run_ids": [],
+                    "runs": 0,
+                    "events": 0,
+                    "edges": 0,
+                    "snapshots": 0,
+                }
 
-def _json_or_none(value: object) -> str | None:
-    return None if value is None else _json(value)
+            placeholders = ", ".join("?" for _ in run_ids)
+            snapshot_count = conn.execute(
+                f"SELECT COUNT(*) FROM snapshots WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0]
+            edge_count = conn.execute(
+                f"SELECT COUNT(*) FROM graph_edges WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0]
+            event_count = conn.execute(
+                f"SELECT COUNT(*) FROM events WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0]
+            conn.execute(f"DELETE FROM snapshots WHERE run_id IN ({placeholders})", run_ids)
+            conn.execute(f"DELETE FROM graph_edges WHERE run_id IN ({placeholders})", run_ids)
+            conn.execute(f"DELETE FROM events WHERE run_id IN ({placeholders})", run_ids)
+            conn.execute(f"DELETE FROM runs WHERE run_id IN ({placeholders})", run_ids)
+            return {
+                "run_ids": run_ids,
+                "runs": len(run_ids),
+                "events": event_count,
+                "edges": edge_count,
+                "snapshots": snapshot_count,
+            }
 
 
 def _loads(value: str | None, default: object) -> object:

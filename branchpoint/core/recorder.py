@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,7 +48,7 @@ from .schema import (
     utc_now_iso,
 )
 from .snapshots import diff_json_like, link_snapshot_metadata, prepare_snapshot_payload
-from .serialization import safe_serialize
+from .serialization import RedactionConfig, prepare_serialized_payload, safe_serialize_for_storage
 from branchpoint.storage.blob_store import BlobStore
 
 
@@ -70,13 +68,17 @@ class TraceContext:
         self._tokens = None
 
     def __enter__(self) -> ActiveTrace:
+        metadata_result = safe_serialize_for_storage(self.metadata, redaction_config=self.recorder.redaction_config)
+        run_metadata = metadata_result.value
+        if metadata_result.redacted:
+            run_metadata["metadata_redaction"] = metadata_result.metadata()
         run = TraceRun(
             run_id=new_run_id(),
             project_id=self.recorder.project_id,
             name=self.name,
             started_at=utc_now_iso(),
             status=RUNNING,
-            metadata=safe_serialize(self.metadata),
+            metadata=run_metadata,
         )
         self.recorder.store.create_run(run)
         self._tokens = set_trace_context(run.run_id, run.project_id)
@@ -109,12 +111,18 @@ class Recorder:
         blob_store: BlobStore,
         provenance_tracker: ProvenanceTracker | None = None,
         strict_event_types: bool = True,
+        redaction_config: RedactionConfig | None = None,
+        max_preview_chars: int = 2_000,
+        max_blob_bytes: int | None = None,
     ) -> None:
         self.project_id = project_id
         self.store = store
         self.blob_store = blob_store
         self.provenance_tracker = provenance_tracker
         self.strict_event_types = strict_event_types
+        self.redaction_config = redaction_config or RedactionConfig.from_rules()
+        self.max_preview_chars = max_preview_chars
+        self.max_blob_bytes = max_blob_bytes
 
     def trace(self, name: str | None = None, metadata: dict[str, Any] | None = None) -> TraceContext:
         return TraceContext(self, name=name, metadata=metadata)
@@ -144,7 +152,10 @@ class Recorder:
         if active_project_id is not None and project_id is not None and project_id != active_project_id:
             raise EventContractError("emit project_id cannot differ from the active trace project_id")
         resolved_project_id = project_id or active_project_id or self.project_id
-        event_metadata = safe_serialize(metadata or {})
+        metadata_result = safe_serialize_for_storage(metadata or {}, redaction_config=self.redaction_config)
+        event_metadata = metadata_result.value
+        if metadata_result.redacted:
+            event_metadata["metadata_redaction"] = metadata_result.metadata()
         validate_event_contract(
             type,
             status,
@@ -160,8 +171,8 @@ class Recorder:
             parent_id=parent_id if parent_id is not None else get_current_parent_event_id(),
             span_id=span_id if span_id is not None else get_current_span_id(),
             timestamp_start=utc_now_iso(),
-            input=safe_serialize(input),
-            output=safe_serialize(output),
+            input=input,
+            output=output,
             input_refs=list(input_refs or []),
             output_refs=list(output_refs or []),
             status=status,
@@ -178,15 +189,33 @@ class Recorder:
 
     def _prepare_payloads(self, event: TraceEvent) -> None:
         if event.input is not None:
-            event.input_hash = _hash_json(event.input)
-            if self.blob_store.should_externalize(event.input):
-                event.input_payload_ref = self.blob_store.put_json(event.run_id, event.event_id, "input", event.input)
+            prepared = prepare_serialized_payload(
+                event.input,
+                redaction_config=self.redaction_config,
+                max_preview_chars=self.max_preview_chars,
+                max_blob_bytes=self.max_blob_bytes,
+            )
+            event.input_hash = prepared.payload_hash
+            _record_payload_safety(event.metadata, "input", redaction=prepared.redaction, truncation=prepared.truncation)
+            if self.blob_store.should_externalize(prepared.value):
+                event.input_payload_ref = self.blob_store.put_json(event.run_id, event.event_id, "input", prepared.value)
                 event.input = None
+            else:
+                event.input = prepared.value
         if event.output is not None:
-            event.output_hash = _hash_json(event.output)
-            if self.blob_store.should_externalize(event.output):
-                event.output_payload_ref = self.blob_store.put_json(event.run_id, event.event_id, "output", event.output)
+            prepared = prepare_serialized_payload(
+                event.output,
+                redaction_config=self.redaction_config,
+                max_preview_chars=self.max_preview_chars,
+                max_blob_bytes=self.max_blob_bytes,
+            )
+            event.output_hash = prepared.payload_hash
+            _record_payload_safety(event.metadata, "output", redaction=prepared.redaction, truncation=prepared.truncation)
+            if self.blob_store.should_externalize(prepared.value):
+                event.output_payload_ref = self.blob_store.put_json(event.run_id, event.event_id, "output", prepared.value)
                 event.output = None
+            else:
+                event.output = prepared.value
 
     def _automatic_snapshots_for_event(self, event: TraceEvent) -> list[Snapshot]:
         snapshots: list[Snapshot] = []
@@ -206,7 +235,13 @@ class Recorder:
                     **(metadata or {}),
                 },
             )
-            prepare_snapshot_payload(snapshot, self.blob_store)
+            prepare_snapshot_payload(
+                snapshot,
+                self.blob_store,
+                redaction_config=self.redaction_config,
+                max_preview_chars=self.max_preview_chars,
+                max_blob_bytes=self.max_blob_bytes,
+            )
             snapshots.append(snapshot)
 
         if event.type == TOOL_OUTPUT and event.output is not None:
@@ -230,6 +265,15 @@ class Recorder:
     def child_context(self, parent_id: str, span_id: str):
         return _ChildContext(parent_id=parent_id, span_id=span_id)
 
+    def hash_payload(self, value: Any) -> str:
+        prepared = prepare_serialized_payload(
+            value,
+            redaction_config=self.redaction_config,
+            max_preview_chars=self.max_preview_chars,
+            max_blob_bytes=self.max_blob_bytes,
+        )
+        return prepared.payload_hash
+
 
 class _ChildContext:
     def __init__(self, parent_id: str, span_id: str) -> None:
@@ -250,9 +294,25 @@ class _ChildContext:
         return False
 
 
-def _hash_json(value: Any) -> str:
-    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def _record_payload_safety(
+    metadata: dict[str, Any],
+    channel: str,
+    *,
+    redaction: dict[str, Any],
+    truncation: dict[str, Any],
+) -> None:
+    if not redaction.get("redacted") and not truncation.get("truncated"):
+        return
+    safety = metadata.get("payload_safety")
+    if not isinstance(safety, dict):
+        safety = {}
+    channel_safety = dict(safety.get(channel) or {})
+    if redaction.get("redacted"):
+        channel_safety["redaction"] = redaction
+    if truncation.get("truncated"):
+        channel_safety["truncation"] = truncation
+    safety[channel] = channel_safety
+    metadata["payload_safety"] = safety
 
 
 def _snapshot_name(event_name: str | None, suffix: str | None) -> str | None:

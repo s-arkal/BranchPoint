@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import inspect
-import hashlib
-import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,7 @@ from branchpoint.core.schema import (
     canonical_state_path,
     validate_snapshot_kind,
 )
-from branchpoint.core.serialization import safe_serialize
+from branchpoint.core.serialization import RedactionCallback, RedactionConfig, hash_serialized_payload, safe_serialize
 from branchpoint.core.snapshots import (
     diff_json_like,
     link_snapshot_metadata,
@@ -69,12 +69,36 @@ class BranchPoint:
         *,
         provenance_mode: str = "hybrid",
         strict_event_types: bool = True,
+        redaction_rules: list[str | re.Pattern[str]] | tuple[str | re.Pattern[str], ...] | None = None,
+        redaction_callbacks: list[RedactionCallback] | tuple[RedactionCallback, ...] | None = None,
+        redaction_replacement: str = "[REDACTED]",
+        include_default_redaction: bool = True,
+        max_inline_bytes: int = 16_000,
+        max_preview_chars: int = 2_000,
+        max_blob_bytes: int | None = None,
     ) -> None:
         self.project_id = project
         self.db_path = db_path
         self.strict_event_types = strict_event_types
-        self.store = SQLiteEventStore(db_path=db_path, strict_event_types=strict_event_types)
-        self.blob_store = BlobStore(Path(db_path).parent)
+        self.redaction_config = RedactionConfig.from_rules(
+            redaction_rules,
+            callbacks=redaction_callbacks,
+            replacement=redaction_replacement,
+            include_defaults=include_default_redaction,
+        )
+        self.max_inline_bytes = max_inline_bytes
+        self.max_preview_chars = max_preview_chars
+        self.max_blob_bytes = max_blob_bytes
+        self.store = SQLiteEventStore(
+            db_path=db_path,
+            strict_event_types=strict_event_types,
+            redaction_config=self.redaction_config,
+        )
+        self.blob_store = BlobStore(
+            Path(db_path).parent,
+            max_inline_bytes=max_inline_bytes,
+            max_blob_bytes=max_blob_bytes,
+        )
         self.provenance_tracker = ProvenanceTracker(provenance_mode=provenance_mode)
         self.recorder = Recorder(
             project_id=project,
@@ -82,6 +106,9 @@ class BranchPoint:
             blob_store=self.blob_store,
             provenance_tracker=self.provenance_tracker,
             strict_event_types=strict_event_types,
+            redaction_config=self.redaction_config,
+            max_preview_chars=max_preview_chars,
+            max_blob_bytes=max_blob_bytes,
         )
 
     def trace(self, name: str | None = None, metadata: dict[str, Any] | None = None):
@@ -132,6 +159,7 @@ class BranchPoint:
             state_name=resolved_state_name,
             state_path=resolved_state_path,
             value=value,
+            hash_payload=self.recorder.hash_payload,
         )
         if auto_refs:
             detail_refs, event_input_refs = collect_input_refs(
@@ -174,6 +202,7 @@ class BranchPoint:
             state_path=resolved_state_path,
             before=before,
             after=after,
+            hash_payload=self.recorder.hash_payload,
         )
         if auto_refs:
             detail_refs, event_input_refs = collect_input_refs(
@@ -245,7 +274,13 @@ class BranchPoint:
             payload=payload,
             metadata=safe_serialize(metadata or {}),
         )
-        prepare_snapshot_payload(snapshot, self.blob_store)
+        prepare_snapshot_payload(
+            snapshot,
+            self.blob_store,
+            redaction_config=self.redaction_config,
+            max_preview_chars=self.max_preview_chars,
+            max_blob_bytes=self.max_blob_bytes,
+        )
         self.store.append_snapshot(snapshot)
 
         if event is not None:
@@ -274,8 +309,50 @@ class BranchPoint:
             raise TraceNotFoundError(f"BranchPoint snapshot {snapshot!r} does not exist")
         payload = resolved_snapshot.payload
         if payload is None and resolved_snapshot.payload_ref is not None:
-            payload = self.blob_store.get_json(resolved_snapshot.payload_ref)
+            payload = self.blob_store.get_json(
+                resolved_snapshot.payload_ref,
+                expected_hash=resolved_snapshot.payload_hash,
+            )
         return verify_snapshot_payload(resolved_snapshot, payload)
+
+    def validate_run_blobs(self, run_id: str) -> list[dict[str, str]]:
+        problems: list[dict[str, str]] = []
+        for event in self.store.list_events(run_id):
+            for field, ref, expected_hash in (
+                ("input", event.input_payload_ref, event.input_hash),
+                ("output", event.output_payload_ref, event.output_hash),
+            ):
+                if ref is None:
+                    continue
+                error = self.blob_store.validate_json(ref, expected_hash)
+                if error is not None:
+                    problems.append({"kind": "event", "id": event.event_id, "field": field, "ref": ref, "error": error})
+        for snapshot in self.store.list_snapshots(run_id):
+            if snapshot.payload_ref is None:
+                continue
+            error = self.blob_store.validate_json(snapshot.payload_ref, snapshot.payload_hash)
+            if error is not None:
+                problems.append(
+                    {
+                        "kind": "snapshot",
+                        "id": snapshot.snapshot_id,
+                        "field": "payload",
+                        "ref": snapshot.payload_ref,
+                        "error": error,
+                    }
+                )
+        return problems
+
+    def cleanup(self, *, older_than: str | timedelta | datetime) -> dict[str, object]:
+        cutoff = _cleanup_cutoff(older_than)
+        result = self.store.cleanup_runs_before(cutoff.isoformat())
+        run_ids = list(result["run_ids"])
+        blobs_removed = 0
+        for run_id in run_ids:
+            if self.blob_store.cleanup_run(run_id):
+                blobs_removed += 1
+        result["blobs_removed"] = blobs_removed
+        return result
 
     def diff(self, before: Any, after: Any) -> list[dict[str, Any]]:
         return diff_json_like(before, after)
@@ -599,22 +676,46 @@ def _state_event_metadata(
     value: Any = None,
     before: Any = None,
     after: Any = None,
+    hash_payload: Any = None,
 ) -> dict[str, Any]:
     event_metadata = dict(metadata or {})
     event_metadata[METADATA_OPERATION] = operation
     event_metadata[METADATA_STATE_NAME] = state_name
     event_metadata[METADATA_STATE_PATH] = state_path
+    hasher = hash_payload or _hash_state_value
     if operation == "read":
-        event_metadata[METADATA_VALUE_HASH] = _hash_state_value(value)
+        event_metadata[METADATA_VALUE_HASH] = hasher(value)
     else:
-        event_metadata[METADATA_BEFORE_HASH] = _hash_state_value(before)
-        event_metadata[METADATA_AFTER_HASH] = _hash_state_value(after)
+        event_metadata[METADATA_BEFORE_HASH] = hasher(before)
+        event_metadata[METADATA_AFTER_HASH] = hasher(after)
     return event_metadata
 
 
 def _hash_state_value(value: Any) -> str:
-    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return hash_serialized_payload(value)
+
+
+def _cleanup_cutoff(older_than: str | timedelta | datetime) -> datetime:
+    if isinstance(older_than, datetime):
+        if older_than.tzinfo is None:
+            return older_than.replace(tzinfo=timezone.utc)
+        return older_than.astimezone(timezone.utc)
+    if isinstance(older_than, timedelta):
+        return datetime.now(timezone.utc) - older_than
+    match = re.fullmatch(r"\s*(\d+)\s*([dhms])\s*", older_than)
+    if match is None:
+        raise ValueError("older_than must be a datetime, timedelta, or duration like '30d', '12h', '10m', or '60s'")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit == "d":
+        delta = timedelta(days=amount)
+    elif unit == "h":
+        delta = timedelta(hours=amount)
+    elif unit == "m":
+        delta = timedelta(minutes=amount)
+    else:
+        delta = timedelta(seconds=amount)
+    return datetime.now(timezone.utc) - delta
 
 
 def _replace_ref_reason(ref: ProvenanceRef, reason: str) -> ProvenanceRef:

@@ -2,45 +2,58 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from .errors import EventContractError
 from .schema import Snapshot
-from .serialization import safe_serialize
+from .serialization import (
+    RedactionConfig,
+    hash_serialized_payload,
+    prepare_serialized_payload,
+    preview_serialize,
+    safe_serialize,
+    safe_serialize_for_storage,
+)
 
 SNAPSHOT_PREVIEW_BYTES = 512
 
 
 def hash_json(value: Any) -> str:
-    payload = json.dumps(safe_serialize(value), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return hash_serialized_payload(value)
 
 
 def preview_json(value: Any, *, max_bytes: int = SNAPSHOT_PREVIEW_BYTES) -> Any:
-    safe_value = safe_serialize(value)
-    rendered = json.dumps(safe_value, sort_keys=True)
-    encoded = rendered.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return safe_value
-    preview_text = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return {
-        "truncated": True,
-        "bytes": len(encoded),
-        "preview": preview_text,
-    }
+    return preview_serialize(value, max_chars=max_bytes)
 
 
-def prepare_snapshot_payload(snapshot: Snapshot, blob_store: Any) -> Snapshot:
-    safe_payload = safe_serialize(snapshot.payload)
-    snapshot.payload_hash = hash_json(safe_payload)
-    snapshot.preview = preview_json(safe_payload)
-    if blob_store.should_externalize(safe_payload):
-        snapshot.payload_ref = blob_store.put_snapshot_json(snapshot.run_id, snapshot.snapshot_id, safe_payload)
+def prepare_snapshot_payload(
+    snapshot: Snapshot,
+    blob_store: Any,
+    *,
+    redaction_config: RedactionConfig | None = None,
+    max_preview_chars: int = SNAPSHOT_PREVIEW_BYTES,
+    max_blob_bytes: int | None = None,
+) -> Snapshot:
+    prepared = prepare_serialized_payload(
+        snapshot.payload,
+        redaction_config=redaction_config,
+        max_preview_chars=max_preview_chars,
+        max_blob_bytes=max_blob_bytes,
+    )
+    snapshot.payload_hash = prepared.payload_hash
+    snapshot.preview = prepared.preview
+    metadata_result = safe_serialize_for_storage(snapshot.metadata or {}, redaction_config=redaction_config)
+    snapshot.metadata = _metadata_with_payload_safety(
+        metadata_result.value,
+        metadata_redaction=metadata_result.metadata() if metadata_result.redacted else None,
+        redaction=prepared.redaction,
+        truncation=prepared.truncation,
+    )
+    if blob_store.should_externalize(prepared.value):
+        snapshot.payload_ref = blob_store.put_snapshot_json(snapshot.run_id, snapshot.snapshot_id, prepared.value)
         snapshot.payload = None
     else:
-        snapshot.payload = safe_payload
+        snapshot.payload = prepared.value
     return snapshot
 
 
@@ -49,6 +62,23 @@ def verify_snapshot_payload(snapshot: Snapshot, payload: Any) -> Any:
     if snapshot.payload_hash is not None and hash_json(safe_payload) != snapshot.payload_hash:
         raise EventContractError(f"Snapshot payload hash mismatch for {snapshot.snapshot_id!r}")
     return safe_payload
+
+
+def _metadata_with_payload_safety(
+    metadata: dict[str, Any],
+    *,
+    metadata_redaction: dict[str, Any] | None,
+    redaction: dict[str, Any],
+    truncation: dict[str, Any],
+) -> dict[str, Any]:
+    safe_metadata = dict(safe_serialize(metadata or {}))
+    if metadata_redaction is not None:
+        safe_metadata["metadata_redaction"] = metadata_redaction
+    if redaction.get("redacted"):
+        safe_metadata["redaction"] = redaction
+    if truncation.get("truncated"):
+        safe_metadata["truncation"] = truncation
+    return safe_metadata
 
 
 def link_snapshot_metadata(metadata: dict[str, Any], snapshot: Snapshot) -> dict[str, Any]:
