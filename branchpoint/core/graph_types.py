@@ -6,6 +6,8 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from .schema import SCHEMA_VERSION, validate_schema_version
+
 CONTROL_FLOW = "controlflow"
 PARENT_CHILD = "parentchild"
 SEQUENCE = "sequence"
@@ -55,11 +57,15 @@ class GraphEdge:
     target_event_id: str
 
     edge_type: str
+    schema_version: str = SCHEMA_VERSION
     weight: float = 0.4
     confidence: float = 1.0
 
     reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.schema_version = validate_schema_version(self.schema_version)
 
 
 @dataclass

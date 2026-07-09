@@ -30,10 +30,12 @@ class BranchPoint:
         db_path: str = ".branchpoint/branchpoint.sqlite",
         *,
         provenance_mode: str = "hybrid",
+        strict_event_types: bool = True,
     ) -> None:
         self.project_id = project
         self.db_path = db_path
-        self.store = SQLiteEventStore(db_path=db_path)
+        self.strict_event_types = strict_event_types
+        self.store = SQLiteEventStore(db_path=db_path, strict_event_types=strict_event_types)
         self.blob_store = BlobStore(Path(db_path).parent)
         self.provenance_tracker = ProvenanceTracker(provenance_mode=provenance_mode)
         self.recorder = Recorder(
@@ -41,6 +43,7 @@ class BranchPoint:
             store=self.store,
             blob_store=self.blob_store,
             provenance_tracker=self.provenance_tracker,
+            strict_event_types=strict_event_types,
         )
 
     def trace(self, name: str | None = None, metadata: dict[str, Any] | None = None):

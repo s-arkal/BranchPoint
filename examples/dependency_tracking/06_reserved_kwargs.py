@@ -51,6 +51,7 @@ def main() -> None:
             type="custom",
             name="manual_source",
             output={"note": "manual dependency source"},
+            metadata={"custom_type": "manual_dependency_source"},
         )
 
         some_tool(

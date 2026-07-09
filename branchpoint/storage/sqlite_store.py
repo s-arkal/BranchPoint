@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from branchpoint.core.graph_types import GraphEdge
-from branchpoint.core.schema import RUNNING, TraceEvent, TraceRun
+from branchpoint.core.schema import (
+    RUNNING,
+    SCHEMA_VERSION,
+    TraceEvent,
+    TraceRun,
+    validate_event_contract,
+    validate_schema_version,
+    validate_status,
+)
 from branchpoint.core.serialization import safe_serialize
 
 
 class SQLiteEventStore:
-    def __init__(self, db_path: str | Path = ".branchpoint/branchpoint.sqlite") -> None:
+    def __init__(self, db_path: str | Path = ".branchpoint/branchpoint.sqlite", *, strict_event_types: bool = True) -> None:
         self.db_path = Path(db_path)
+        self.strict_event_types = strict_event_types
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -32,6 +40,7 @@ class SQLiteEventStore:
                     run_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
                     name TEXT,
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
@@ -46,6 +55,7 @@ class SQLiteEventStore:
                     event_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
                     project_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
                     type TEXT NOT NULL,
                     name TEXT,
                     parent_id TEXT,
@@ -73,6 +83,7 @@ class SQLiteEventStore:
                     run_id TEXT NOT NULL,
                     source_event_id TEXT NOT NULL,
                     target_event_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
                     edge_type TEXT NOT NULL,
                     weight REAL NOT NULL,
                     confidence REAL NOT NULL,
@@ -82,6 +93,9 @@ class SQLiteEventStore:
                 )
                 """
             )
+            self._ensure_column(conn, "runs", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
+            self._ensure_column(conn, "events", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
+            self._ensure_column(conn, "graph_edges", "schema_version", f"TEXT NOT NULL DEFAULT '{SCHEMA_VERSION}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_parent_id ON events(parent_id)")
@@ -89,17 +103,29 @@ class SQLiteEventStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON graph_edges(source_event_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target_event_id)")
 
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def create_run(self, run: TraceRun) -> None:
+        validate_schema_version(run.schema_version)
+        validate_status(run.status)
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, project_id, name, status, started_at, ended_at, failure_label, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO runs (
+                    run_id, project_id, name, schema_version, status, started_at,
+                    ended_at, failure_label, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.run_id,
                     run.project_id,
                     run.name,
+                    run.schema_version,
                     run.status,
                     run.started_at,
                     run.ended_at,
@@ -109,6 +135,7 @@ class SQLiteEventStore:
             )
 
     def finish_run(self, run_id: str, status: str, failure_label: str | None = None) -> None:
+        validate_status(status)
         ended_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             conn.execute(
@@ -127,21 +154,29 @@ class SQLiteEventStore:
         return [_run_from_row(row) for row in rows]
 
     def append_event(self, event: TraceEvent) -> None:
+        validate_event_contract(
+            event.type,
+            event.status,
+            event.metadata,
+            strict_event_types=self.strict_event_types,
+            schema_version=event.schema_version,
+        )
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO events (
-                    event_id, run_id, project_id, type, name, parent_id, span_id,
-                    timestamp_start, timestamp_end, status, input_json, output_json,
-                    input_refs_json, output_refs_json, metadata_json, input_payload_ref,
-                    output_payload_ref, input_hash, output_hash
+                    event_id, run_id, project_id, schema_version, type, name, parent_id,
+                    span_id, timestamp_start, timestamp_end, status, input_json,
+                    output_json, input_refs_json, output_refs_json, metadata_json,
+                    input_payload_ref, output_payload_ref, input_hash, output_hash
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_id,
                     event.run_id,
                     event.project_id,
+                    event.schema_version,
                     event.type,
                     event.name,
                     event.parent_id,
@@ -170,20 +205,22 @@ class SQLiteEventStore:
         return [_event_from_row(row) for row in rows]
 
     def append_edge(self, edge: GraphEdge) -> None:
+        validate_schema_version(edge.schema_version)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO graph_edges (
-                    edge_id, run_id, source_event_id, target_event_id, edge_type,
-                    weight, confidence, reason, metadata_json
+                    edge_id, run_id, source_event_id, target_event_id,
+                    schema_version, edge_type, weight, confidence, reason, metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     edge.edge_id,
                     edge.run_id,
                     edge.source_event_id,
                     edge.target_event_id,
+                    edge.schema_version,
                     edge.edge_type,
                     edge.weight,
                     edge.confidence,
@@ -219,6 +256,7 @@ def _run_from_row(row: sqlite3.Row) -> TraceRun:
         project_id=row["project_id"],
         name=row["name"],
         started_at=row["started_at"],
+        schema_version=row["schema_version"] or SCHEMA_VERSION,
         ended_at=row["ended_at"],
         status=row["status"] or RUNNING,
         failure_label=row["failure_label"],
@@ -232,6 +270,7 @@ def _event_from_row(row: sqlite3.Row) -> TraceEvent:
         run_id=row["run_id"],
         project_id=row["project_id"],
         type=row["type"],
+        schema_version=row["schema_version"] or SCHEMA_VERSION,
         name=row["name"],
         parent_id=row["parent_id"],
         span_id=row["span_id"],
@@ -257,6 +296,7 @@ def _edge_from_row(row: sqlite3.Row) -> GraphEdge:
         source_event_id=row["source_event_id"],
         target_event_id=row["target_event_id"],
         edge_type=row["edge_type"],
+        schema_version=row["schema_version"] or SCHEMA_VERSION,
         weight=row["weight"],
         confidence=row["confidence"],
         reason=row["reason"],

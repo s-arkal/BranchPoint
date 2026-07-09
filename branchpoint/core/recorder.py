@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -19,11 +20,11 @@ from .context import (
     set_span,
     set_trace_context,
 )
-from .errors import NoActiveTraceError
+from .errors import EventContractError, NoActiveTraceError
 from .event_store import EventStore
 from .ids import new_event_id, new_run_id, new_span_id
 from .provenance import ProvenanceTracker
-from .schema import ERROR, RUNNING, SUCCESS, TraceEvent, TraceRun, utc_now_iso
+from .schema import CANCELLED, ERROR, RUNNING, SUCCESS, TraceEvent, TraceRun, validate_event_contract, utc_now_iso
 from .serialization import safe_serialize
 from branchpoint.storage.blob_store import BlobStore
 
@@ -63,6 +64,8 @@ class TraceContext:
                 return False
             if exc is None:
                 self.recorder.store.finish_run(self.active.run_id, SUCCESS)
+            elif exc_type is not None and issubclass(exc_type, asyncio.CancelledError):
+                self.recorder.store.finish_run(self.active.run_id, CANCELLED)
             else:
                 self.recorder.store.finish_run(self.active.run_id, ERROR)
         finally:
@@ -80,11 +83,13 @@ class Recorder:
         store: EventStore,
         blob_store: BlobStore,
         provenance_tracker: ProvenanceTracker | None = None,
+        strict_event_types: bool = True,
     ) -> None:
         self.project_id = project_id
         self.store = store
         self.blob_store = blob_store
         self.provenance_tracker = provenance_tracker
+        self.strict_event_types = strict_event_types
 
     def trace(self, name: str | None = None, metadata: dict[str, Any] | None = None) -> TraceContext:
         return TraceContext(self, name=name, metadata=metadata)
@@ -104,10 +109,23 @@ class Recorder:
         run_id: str | None = None,
         project_id: str | None = None,
     ) -> TraceEvent:
+        active_run_id = get_current_run_id()
+        active_project_id = get_current_project_id()
         resolved_run_id = run_id or get_current_run_id()
         if resolved_run_id is None:
             raise NoActiveTraceError("emit requires an active trace or explicit run_id")
-        resolved_project_id = project_id or get_current_project_id() or self.project_id
+        if active_run_id is not None and run_id is not None and run_id != active_run_id:
+            raise EventContractError("emit run_id cannot differ from the active trace run_id")
+        if active_project_id is not None and project_id is not None and project_id != active_project_id:
+            raise EventContractError("emit project_id cannot differ from the active trace project_id")
+        resolved_project_id = project_id or active_project_id or self.project_id
+        event_metadata = safe_serialize(metadata or {})
+        validate_event_contract(
+            type,
+            status,
+            event_metadata,
+            strict_event_types=self.strict_event_types,
+        )
         event = TraceEvent(
             event_id=new_event_id(),
             run_id=resolved_run_id,
@@ -122,7 +140,7 @@ class Recorder:
             input_refs=list(input_refs or []),
             output_refs=list(output_refs or []),
             status=status,
-            metadata=safe_serialize(metadata or {}),
+            metadata=event_metadata,
         )
         self._prepare_payloads(event)
         self.store.append_event(event)

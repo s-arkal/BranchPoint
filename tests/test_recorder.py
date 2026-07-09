@@ -2,8 +2,8 @@ import pytest
 
 from branchpoint import BranchPoint
 from branchpoint.core.context import get_current_run_id
-from branchpoint.core.errors import NoActiveTraceError
-from branchpoint.core.schema import ERROR, SUCCESS, TOOL_CALL, TOOL_OUTPUT, USER_REQUEST
+from branchpoint.core.errors import EventContractError, NoActiveTraceError
+from branchpoint.core.schema import CUSTOM, ERROR, SUCCESS, TOOL_CALL, TOOL_OUTPUT, USER_REQUEST
 from branchpoint.storage.blob_store import MAX_INLINE_BYTES
 
 
@@ -68,6 +68,52 @@ def test_decorated_exception_records_error_and_reraises(tmp_path):
     assert run.status == ERROR
     assert output.status == ERROR
     assert output.output == {"error_type": "ValueError", "error": "bad"}
+    assert output.metadata["error_type"] == "ValueError"
+    assert output.metadata["error_message"] == "bad"
+    assert output.metadata["exception_repr"] == "ValueError('bad')"
+
+
+def test_strict_event_contract_rejects_invalid_event_type_status_and_uncontrolled_custom(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    with bp.trace("contract"):
+        with pytest.raises(EventContractError):
+            bp.emit(type="madeup")
+        with pytest.raises(EventContractError):
+            bp.emit(type=USER_REQUEST, status="done")
+        with pytest.raises(EventContractError):
+            bp.emit(type=CUSTOM, name="loose_custom")
+
+
+def test_controlled_custom_event_and_non_strict_compatibility_mode(tmp_path):
+    strict_bp = BranchPoint(project="demo", db_path=str(tmp_path / "strict.sqlite"))
+    with strict_bp.trace("custom") as strict_trace:
+        strict_event = strict_bp.emit(
+            type=CUSTOM,
+            name="manual",
+            metadata={"custom_type": "demo.manual"},
+        )
+
+    compat_bp = BranchPoint(project="demo", db_path=str(tmp_path / "compat.sqlite"), strict_event_types=False)
+    with compat_bp.trace("compat") as compat_trace:
+        raw_event = compat_bp.emit(type="legacy_event")
+        loose_custom = compat_bp.emit(type=CUSTOM, name="loose_custom")
+
+    assert strict_bp.store.list_events(strict_trace.run_id) == [strict_event]
+    assert compat_bp.store.list_events(compat_trace.run_id) == [raw_event, loose_custom]
+
+
+def test_emit_rejects_explicit_context_mismatch(tmp_path):
+    bp = BranchPoint(project="demo", db_path=str(tmp_path / "branchpoint.sqlite"))
+
+    with bp.trace("context") as trace:
+        with pytest.raises(EventContractError):
+            bp.emit(type=USER_REQUEST, run_id="run_other")
+        with pytest.raises(EventContractError):
+            bp.emit(type=USER_REQUEST, project_id="other")
+        event = bp.emit(type=USER_REQUEST)
+
+    assert event.run_id == trace.run_id
 
 
 def test_large_payloads_are_externalized_with_hash_and_ref(tmp_path):

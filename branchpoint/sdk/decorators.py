@@ -21,6 +21,7 @@ from branchpoint.core.schema import (
     SUCCESS,
     TOOL_CALL,
     TOOL_OUTPUT,
+    error_metadata,
 )
 from branchpoint.core.serialization import safe_serialize
 
@@ -200,7 +201,7 @@ def _call_output_pair(
                         output=safe_serialize(exc),
                         status=ERROR,
                         metadata=metadata,
-                        bp_metadata=bp_metadata,
+                        bp_metadata=_metadata_with_error(bp_metadata, exc),
                     )
                     raise
                 output_event = _emit_output_event(
@@ -252,7 +253,7 @@ def _call_output_pair(
                     output=safe_serialize(exc),
                     status=ERROR,
                     metadata=metadata,
-                    bp_metadata=bp_metadata,
+                    bp_metadata=_metadata_with_error(bp_metadata, exc),
                 )
                 raise
             output_event = _emit_output_event(
@@ -321,7 +322,7 @@ def _memory_event(
                         output=safe_serialize(exc),
                         input_refs=upstream_ids,
                         status=ERROR,
-                        metadata=event_metadata,
+                        metadata=_metadata_with_error(event_metadata, exc),
                     )
                     raise
                 event = recorder.emit(
@@ -367,7 +368,7 @@ def _memory_event(
                     output=safe_serialize(exc),
                     input_refs=upstream_ids,
                     status=ERROR,
-                    metadata=event_metadata,
+                    metadata=_metadata_with_error(event_metadata, exc),
                 )
                 raise
             event = recorder.emit(
@@ -488,6 +489,12 @@ def _merge_metadata(target: dict[str, Any], source: dict[str, Any] | None) -> No
             target["provenance"] = merged
         else:
             target[key] = value
+
+
+def _metadata_with_error(metadata: dict[str, Any] | None, exc: BaseException) -> dict[str, Any]:
+    event_metadata = dict(metadata or {})
+    _merge_metadata(event_metadata, error_metadata(exc))
+    return event_metadata
 
 
 def _unique_ids(event_ids: list[str]) -> list[str]:
