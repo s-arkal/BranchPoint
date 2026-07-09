@@ -7,7 +7,6 @@ dist/
 *.egg-info/
 
 # Local planning artifacts
-plans/advanced-provenance-dependency-tracking.md
-plans/advanced-provenance-dependency-tracking/
-plan_archive/
+docs/
+knowledge_base/
 *.py[cod]
