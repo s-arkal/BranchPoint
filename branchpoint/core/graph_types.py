@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import EventContractError
-from .schema import SCHEMA_VERSION, validate_schema_version
+from .schema import SCHEMA_VERSION, utc_now_iso, validate_schema_version
+
+GRAPH_BUILDER_VERSION = "graph_builder.v1"
+GRAPH_RULE_VERSION = "graph_rules.v1"
 
 CONTROL_FLOW = "controlflow"
 PARENT_CHILD = "parentchild"
@@ -176,3 +179,14 @@ class TraceGraph:
     run_id: str
     events: list[Any] = field(default_factory=list)
     edges: list[GraphEdge] = field(default_factory=list)
+
+
+@dataclass
+class GraphBuild:
+    build_id: str
+    run_id: str
+    builder_version: str = GRAPH_BUILDER_VERSION
+    rule_version: str = GRAPH_RULE_VERSION
+    created_at: str = field(default_factory=utc_now_iso)
+    status: str = "success"
+    metadata: dict[str, Any] = field(default_factory=dict)

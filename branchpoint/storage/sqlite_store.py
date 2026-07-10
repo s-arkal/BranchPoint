@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from branchpoint.core.graph_types import GraphEdge
+from branchpoint.core.graph_types import GraphBuild, GraphEdge
 from branchpoint.core.schema import (
     RUNNING,
     SCHEMA_VERSION,
@@ -104,6 +104,20 @@ class SQLiteEventStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS graph_builds (
+                    build_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    builder_version TEXT NOT NULL,
+                    rule_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    metadata_json TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS snapshots (
                     snapshot_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
@@ -133,6 +147,7 @@ class SQLiteEventStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_run_id ON graph_edges(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON graph_edges(source_event_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target_event_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_builds_run_id ON graph_builds(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_run_id ON snapshots(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_event_id ON snapshots(event_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_kind ON snapshots(kind)")
@@ -238,6 +253,11 @@ class SQLiteEventStore:
             ).fetchall()
         return [_event_from_row(row) for row in rows]
 
+    def get_event(self, event_id: str) -> TraceEvent | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
+        return _event_from_row(row) if row else None
+
     def update_event_metadata(self, event_id: str, metadata: dict) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -277,6 +297,35 @@ class SQLiteEventStore:
                 (run_id,),
             ).fetchall()
         return [_edge_from_row(row) for row in rows]
+
+    def append_graph_build(self, build: GraphBuild) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_builds (
+                    build_id, run_id, builder_version, rule_version,
+                    created_at, status, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    build.build_id,
+                    build.run_id,
+                    build.builder_version,
+                    build.rule_version,
+                    build.created_at,
+                    build.status,
+                    self._json(build.metadata),
+                ),
+            )
+
+    def list_graph_builds(self, run_id: str) -> list[GraphBuild]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_builds WHERE run_id = ? ORDER BY created_at ASC, build_id ASC",
+                (run_id,),
+            ).fetchall()
+        return [_graph_build_from_row(row) for row in rows]
 
     def append_snapshot(self, snapshot: Snapshot) -> None:
         validate_schema_version(snapshot.schema_version)
@@ -360,10 +409,15 @@ class SQLiteEventStore:
                     "runs": 0,
                     "events": 0,
                     "edges": 0,
+                    "graph_builds": 0,
                     "snapshots": 0,
                 }
 
             placeholders = ", ".join("?" for _ in run_ids)
+            build_count = conn.execute(
+                f"SELECT COUNT(*) FROM graph_builds WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0]
             snapshot_count = conn.execute(
                 f"SELECT COUNT(*) FROM snapshots WHERE run_id IN ({placeholders})",
                 run_ids,
@@ -377,6 +431,7 @@ class SQLiteEventStore:
                 run_ids,
             ).fetchone()[0]
             conn.execute(f"DELETE FROM snapshots WHERE run_id IN ({placeholders})", run_ids)
+            conn.execute(f"DELETE FROM graph_builds WHERE run_id IN ({placeholders})", run_ids)
             conn.execute(f"DELETE FROM graph_edges WHERE run_id IN ({placeholders})", run_ids)
             conn.execute(f"DELETE FROM events WHERE run_id IN ({placeholders})", run_ids)
             conn.execute(f"DELETE FROM runs WHERE run_id IN ({placeholders})", run_ids)
@@ -385,6 +440,7 @@ class SQLiteEventStore:
                 "runs": len(run_ids),
                 "events": event_count,
                 "edges": edge_count,
+                "graph_builds": build_count,
                 "snapshots": snapshot_count,
             }
 
@@ -443,6 +499,18 @@ def _edge_from_row(row: sqlite3.Row) -> GraphEdge:
         weight=row["weight"],
         confidence=row["confidence"],
         reason=row["reason"],
+        metadata=dict(_loads(row["metadata_json"], {})),
+    )
+
+
+def _graph_build_from_row(row: sqlite3.Row) -> GraphBuild:
+    return GraphBuild(
+        build_id=row["build_id"],
+        run_id=row["run_id"],
+        builder_version=row["builder_version"],
+        rule_version=row["rule_version"],
+        created_at=row["created_at"],
+        status=row["status"],
         metadata=dict(_loads(row["metadata_json"], {})),
     )
 
