@@ -347,6 +347,54 @@ class BranchPoint:
                 )
         return problems
 
+    def event_payload(self, event_id: str, field: str) -> Any:
+        if field not in {"input", "output"}:
+            raise EventContractError("event_payload field must be 'input' or 'output'")
+        event = self.store.get_event(event_id)
+        if event is None:
+            raise TraceNotFoundError(f"BranchPoint event {event_id!r} does not exist")
+        payload = event.input if field == "input" else event.output
+        ref = event.input_payload_ref if field == "input" else event.output_payload_ref
+        expected_hash = event.input_hash if field == "input" else event.output_hash
+        if payload is None and ref is not None:
+            return self.blob_store.get_json(ref, expected_hash=expected_hash)
+        return payload
+
+    def validate_run(self, run_id: str) -> dict[str, Any]:
+        graph_report = GraphBuilder(self.store).validate_graph(run_id)
+        blob_problems = self.validate_run_blobs(run_id)
+        errors = list(graph_report["errors"])
+        for problem in blob_problems:
+            errors.append(
+                {
+                    "code": "blob_validation_failed",
+                    "kind": problem["kind"],
+                    "id": problem["id"],
+                    "field": problem["field"],
+                    "ref": problem["ref"],
+                    "message": problem["error"],
+                }
+            )
+
+        snapshot_link_errors = _snapshot_link_errors(self.store.list_events(run_id), self.store.list_snapshots(run_id))
+        errors.extend(snapshot_link_errors)
+
+        warnings = list(graph_report["warnings"])
+        return {
+            "status": "fail" if errors else "pass",
+            "run_id": run_id,
+            "errors": errors,
+            "warnings": warnings,
+            "summary": {
+                **graph_report["summary"],
+                "blob_problem_count": len(blob_problems),
+                "snapshot_link_error_count": len(snapshot_link_errors),
+                "error_count": len(errors),
+                "warning_count": len(warnings),
+            },
+            "graph": graph_report,
+        }
+
     def cleanup(self, *, older_than: str | timedelta | datetime) -> dict[str, object]:
         cutoff = _cleanup_cutoff(older_than)
         result = self.store.cleanup_runs_before(cutoff.isoformat())
@@ -777,6 +825,35 @@ def _state_event_metadata(
         event_metadata[METADATA_BEFORE_HASH] = hasher(before)
         event_metadata[METADATA_AFTER_HASH] = hasher(after)
     return event_metadata
+
+
+def _snapshot_link_errors(events: list[Any], snapshots: list[Snapshot]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    snapshot_ids = {snapshot.snapshot_id for snapshot in snapshots}
+    for event in events:
+        linked_snapshot_ids = event.metadata.get("snapshot_ids")
+        if linked_snapshot_ids is None:
+            continue
+        if not isinstance(linked_snapshot_ids, list):
+            errors.append(
+                {
+                    "code": "malformed_snapshot_links",
+                    "event_id": event.event_id,
+                    "message": 'Event metadata["snapshot_ids"] must be a list',
+                }
+            )
+            continue
+        for snapshot_id in linked_snapshot_ids:
+            if snapshot_id not in snapshot_ids:
+                errors.append(
+                    {
+                        "code": "broken_snapshot_link",
+                        "event_id": event.event_id,
+                        "snapshot_id": snapshot_id,
+                        "message": "Event metadata references a missing snapshot",
+                    }
+                )
+    return errors
 
 
 def _hash_state_value(value: Any) -> str:

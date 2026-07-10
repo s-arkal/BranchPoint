@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import hashlib
 from typing import Any
 
 import networkx as nx
@@ -15,6 +16,7 @@ from .graph_types import (
     EDGE_SOURCE_GRAPH_BUILDER_INFERRED,
     EDGE_SOURCE_HANDOFF_FOLLOW,
     EDGE_SOURCE_INPUT_REF,
+    EDGE_SOURCE_KINDS,
     EDGE_SOURCE_MEMORY_KEY_MATCH,
     EDGE_SOURCE_OUTPUT_REF,
     EDGE_SOURCE_PARENT_CHILD,
@@ -22,6 +24,8 @@ from .graph_types import (
     EDGE_SOURCE_STATE_PATH_MATCH,
     EXPLICIT_INPUT_REF,
     EXPLICIT_OUTPUT_REF,
+    GRAPH_BUILDER_VERSION,
+    GRAPH_RULE_VERSION,
     HANDOFF_DEPENDENCY,
     LLM_RESPONSE_DEPENDENCY,
     MEMORY_DEPENDENCY,
@@ -33,8 +37,11 @@ from .graph_types import (
     STATE_DEPENDENCY,
     TOOL_RESULT_DEPENDENCY,
     VALIDATION_DEPENDENCY,
+    GraphBuild,
     GraphEdge,
     deterministic_edge_id,
+    validate_edge_type,
+    validate_edge_weight,
 )
 from .errors import EventContractError
 from .schema import (
@@ -57,18 +64,38 @@ from .schema import (
     canonical_state_name,
     canonical_state_path,
     state_path_contains,
+    utc_now_iso,
+    validate_schema_version,
 )
 
 
 class GraphBuilder:
-    def __init__(self, store: EventStore):
+    def __init__(
+        self,
+        store: EventStore,
+        *,
+        builder_version: str = GRAPH_BUILDER_VERSION,
+        rule_version: str = GRAPH_RULE_VERSION,
+    ):
         self.store = store
+        self.builder_version = builder_version
+        self.rule_version = rule_version
 
     def build(self, run_id: str):
         events = self.store.list_events(run_id)
         inferred_edges = self.infer_edges(run_id, events)
         self.persist_edges(inferred_edges)
         edges = self.merge_persisted_edges(events, inferred_edges)
+        self._record_build(
+            run_id,
+            status="success",
+            metadata={
+                "event_count": len(events),
+                "inferred_edge_count": len(inferred_edges),
+                "persisted_edge_count": len(self.store.list_edges(run_id)),
+                "returned_edge_count": len(edges),
+            },
+        )
         return self.to_networkx(events, edges)
 
     def infer_edges(self, run_id: str, events: list[TraceEvent]) -> list[GraphEdge]:
@@ -296,6 +323,120 @@ class GraphBuilder:
             )
         return graph
 
+    def export_json(self, run_id: str) -> dict[str, Any]:
+        graph = self.build(run_id)
+        builds = self.store.list_graph_builds(run_id)
+        latest_build = builds[-1] if builds else None
+        return {
+            "schema_version": "branchpoint.graph_export.v1",
+            "run_id": run_id,
+            "builder_version": self.builder_version,
+            "rule_version": self.rule_version,
+            "build": _graph_build_to_dict(latest_build) if latest_build is not None else None,
+            "nodes": [_event_to_node(graph.nodes[node]["event"]) for node in sorted(graph.nodes)],
+            "edges": [
+                _edge_to_dict(source, target, key, data)
+                for source, target, key, data in sorted(
+                    graph.edges(keys=True, data=True),
+                    key=lambda item: (item[0], item[1], item[2]),
+                )
+            ],
+        }
+
+    def validate_graph(self, run_id: str) -> dict[str, Any]:
+        errors: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        run = self.store.get_run(run_id)
+        if run is None:
+            errors.append({"code": "missing_run", "message": f"Run {run_id!r} does not exist"})
+            events: list[TraceEvent] = []
+        else:
+            events = self.store.list_events(run_id)
+
+        event_ids = {event.event_id for event in events}
+        for event in events:
+            if event.parent_id is not None and event.parent_id not in event_ids:
+                errors.append(
+                    {
+                        "code": "broken_parent_id",
+                        "event_id": event.event_id,
+                        "parent_id": event.parent_id,
+                        "message": "Event parent_id does not point to an event in the run",
+                    }
+                )
+            _validate_event_refs(event, event_ids, "input_refs", errors)
+            _validate_event_refs(event, event_ids, "output_refs", errors)
+
+        if run is not None:
+            self.build(run_id)
+        edges = self.store.list_edges(run_id)
+        for edge in edges:
+            _validate_edge(edge, event_ids, errors, warnings)
+
+        if run is not None and not events:
+            warnings.append({"code": "empty_run", "message": "Run has no events"})
+
+        return {
+            "status": "fail" if errors else "pass",
+            "run_id": run_id,
+            "builder_version": self.builder_version,
+            "rule_version": self.rule_version,
+            "errors": errors,
+            "warnings": warnings,
+            "summary": {
+                "event_count": len(events),
+                "edge_count": len(edges),
+                "error_count": len(errors),
+                "warning_count": len(warnings),
+            },
+        }
+
+    def downstream_dependents(self, run_id: str, event_id: str) -> list[str]:
+        graph = self.build(run_id)
+        _require_graph_node(graph, event_id)
+        return _ordered_nodes(nx.descendants(graph, event_id), graph)
+
+    def upstream_evidence(self, run_id: str, event_id: str) -> list[str]:
+        graph = self.build(run_id)
+        _require_graph_node(graph, event_id)
+        return _ordered_nodes(nx.ancestors(graph, event_id), graph)
+
+    def ancestors_of_failure(self, run_id: str, failure_event_id: str) -> list[str]:
+        return self.upstream_evidence(run_id, failure_event_id)
+
+    def paths_to_failure(
+        self,
+        run_id: str,
+        source_event_id: str,
+        failure_event_id: str,
+        *,
+        cutoff: int | None = None,
+        max_paths: int = 100,
+    ) -> list[list[str]]:
+        graph = self.build(run_id)
+        _require_graph_node(graph, source_event_id)
+        _require_graph_node(graph, failure_event_id)
+        paths: list[list[str]] = []
+        for path in nx.all_simple_paths(graph, source_event_id, failure_event_id, cutoff=cutoff):
+            paths.append(list(path))
+            if len(paths) >= max_paths:
+                break
+        return paths
+
+    def _record_build(self, run_id: str, *, status: str, metadata: dict[str, Any]) -> None:
+        created_at = utc_now_iso()
+        key = f"{run_id}:{self.builder_version}:{self.rule_version}:{created_at}:{status}"
+        build = GraphBuild(
+            build_id="gbuild_" + hashlib.sha256(key.encode()).hexdigest()[:24],
+            run_id=run_id,
+            builder_version=self.builder_version,
+            rule_version=self.rule_version,
+            created_at=created_at,
+            status=status,
+            metadata=metadata,
+        )
+        self.store.append_graph_build(build)
+
 
 def infer_dependency_edge_type(source_event: TraceEvent | None, target_event: TraceEvent | None) -> str:
     if source_event is None or target_event is None:
@@ -423,3 +564,150 @@ def _unique_metadata_values(values: Iterable[Any]) -> list[Any]:
             unique.append(value)
             seen.add(marker)
     return unique
+
+
+def _graph_build_to_dict(build: GraphBuild) -> dict[str, Any]:
+    return {
+        "build_id": build.build_id,
+        "run_id": build.run_id,
+        "builder_version": build.builder_version,
+        "rule_version": build.rule_version,
+        "created_at": build.created_at,
+        "status": build.status,
+        "metadata": build.metadata,
+    }
+
+
+def _event_to_node(event: TraceEvent) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "run_id": event.run_id,
+        "project_id": event.project_id,
+        "schema_version": event.schema_version,
+        "type": event.type,
+        "name": event.name,
+        "parent_id": event.parent_id,
+        "span_id": event.span_id,
+        "timestamp_start": event.timestamp_start,
+        "timestamp_end": event.timestamp_end,
+        "status": event.status,
+        "input": event.input,
+        "output": event.output,
+        "input_refs": event.input_refs,
+        "output_refs": event.output_refs,
+        "metadata": event.metadata,
+        "input_payload_ref": event.input_payload_ref,
+        "output_payload_ref": event.output_payload_ref,
+        "input_hash": event.input_hash,
+        "output_hash": event.output_hash,
+    }
+
+
+def _edge_to_dict(source: str, target: str, key: str, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "edge_id": key,
+        "source_event_id": source,
+        "target_event_id": target,
+        "edge_type": data["edge_type"],
+        "weight": data["weight"],
+        "confidence": data["confidence"],
+        "reason": data["reason"],
+        "metadata": data["metadata"],
+    }
+
+
+def _validate_event_refs(
+    event: TraceEvent,
+    event_ids: set[str],
+    field_name: str,
+    errors: list[dict[str, Any]],
+) -> None:
+    refs = getattr(event, field_name)
+    for ref in refs:
+        if not isinstance(ref, str) or not ref:
+            errors.append(
+                {
+                    "code": "malformed_event_ref",
+                    "event_id": event.event_id,
+                    "field": field_name,
+                    "ref": ref,
+                    "message": f"Event {field_name} contains a malformed ref",
+                }
+            )
+            continue
+        if ref not in event_ids:
+            errors.append(
+                {
+                    "code": "broken_event_ref",
+                    "event_id": event.event_id,
+                    "field": field_name,
+                    "ref": ref,
+                    "message": f"Event {field_name} points outside the run",
+                }
+            )
+
+
+def _validate_edge(
+    edge: GraphEdge,
+    event_ids: set[str],
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> None:
+    try:
+        validate_schema_version(edge.schema_version)
+    except EventContractError as exc:
+        errors.append({"code": "invalid_edge_schema_version", "edge_id": edge.edge_id, "message": str(exc)})
+    try:
+        validate_edge_type(edge.edge_type)
+    except EventContractError as exc:
+        errors.append({"code": "invalid_edge_type", "edge_id": edge.edge_id, "message": str(exc)})
+    for name, value in (("weight", edge.weight), ("confidence", edge.confidence)):
+        try:
+            validate_edge_weight(name, value)
+        except EventContractError as exc:
+            errors.append({"code": f"invalid_edge_{name}", "edge_id": edge.edge_id, "message": str(exc)})
+    if edge.source_event_id not in event_ids:
+        errors.append(
+            {
+                "code": "invalid_edge_source",
+                "edge_id": edge.edge_id,
+                "event_id": edge.source_event_id,
+                "message": "Edge source_event_id does not point to an event in the run",
+            }
+        )
+    if edge.target_event_id not in event_ids:
+        errors.append(
+            {
+                "code": "invalid_edge_target",
+                "edge_id": edge.edge_id,
+                "event_id": edge.target_event_id,
+                "message": "Edge target_event_id does not point to an event in the run",
+            }
+        )
+    if edge.source_event_id == edge.target_event_id:
+        warnings.append(
+            {
+                "code": "self_edge",
+                "edge_id": edge.edge_id,
+                "message": "Edge points an event to itself",
+            }
+        )
+    source_kind = edge.metadata.get("source_kind")
+    if source_kind not in EDGE_SOURCE_KINDS:
+        errors.append(
+            {
+                "code": "missing_edge_provenance",
+                "edge_id": edge.edge_id,
+                "source_kind": source_kind,
+                "message": "Edge metadata must include a valid source_kind",
+            }
+        )
+
+
+def _require_graph_node(graph: nx.MultiDiGraph, event_id: str) -> None:
+    if event_id not in graph:
+        raise EventContractError(f"BranchPoint graph does not contain event {event_id!r}")
+
+
+def _ordered_nodes(nodes: Iterable[str], graph: nx.MultiDiGraph) -> list[str]:
+    return sorted(nodes, key=lambda node: (graph.nodes[node].get("timestamp_start") or "", node))

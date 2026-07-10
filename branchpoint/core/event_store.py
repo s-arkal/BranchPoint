@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .graph_types import GraphEdge
+from .graph_types import GraphBuild, GraphEdge
 from .schema import Snapshot, TraceEvent, TraceRun
 
 
@@ -34,6 +34,12 @@ class EventStore(Protocol):
         ...
 
     def list_edges(self, run_id: str) -> list[GraphEdge]:
+        ...
+
+    def append_graph_build(self, build: GraphBuild) -> None:
+        ...
+
+    def list_graph_builds(self, run_id: str) -> list[GraphBuild]:
         ...
 
     def append_snapshot(self, snapshot: Snapshot) -> None:
