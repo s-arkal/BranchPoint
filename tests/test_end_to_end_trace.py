@@ -5,12 +5,13 @@ from pathlib import Path
 from branchpoint import BranchPoint
 from branchpoint.cli.main import main
 from branchpoint.core.graph_builder import GraphBuilder
-from branchpoint.core.graph_types import STATE_DEPENDENCY, TOOL_RESULT_DEPENDENCY
+from branchpoint.core.graph_types import MEMORY_DEPENDENCY, STATE_DEPENDENCY, TOOL_RESULT_DEPENDENCY
 from branchpoint.core.schema import (
     FAILURE_LABEL,
     FINAL_OUTPUT,
     LLM_CALL,
     LLM_OUTPUT,
+    MEMORY_READ,
     MEMORY_WRITE,
     TOOL_CALL,
     TOOL_OUTPUT,
@@ -81,6 +82,7 @@ def test_refund_demo_dependency_shape(tmp_path):
     llm_call = _event(events, LLM_CALL, "interpret_payment_history")
     llm_output = _event(events, LLM_OUTPUT, "interpret_payment_history")
     memory_write = _event(events, MEMORY_WRITE, "write_refund_status")
+    memory_read = _event(events, MEMORY_READ, "read_refund_status")
     final_output = _event(events, FINAL_OUTPUT, "final_answer")
     failure_label = _event(events, FAILURE_LABEL, "evaluator_result")
 
@@ -88,12 +90,13 @@ def test_refund_demo_dependency_shape(tmp_path):
     assert any(detail["event_id"] == tool_output.event_id for detail in llm_details)
     assert any(detail["path"] == ["refund_eligible"] for detail in llm_details)
     assert llm_output.event_id in memory_write.input_refs
-    assert final_output.input_refs == [memory_write.event_id]
+    assert final_output.input_refs == [memory_read.event_id]
     assert failure_label.input_refs == [final_output.event_id]
 
     assert _has_edge(graph, tool_output.event_id, llm_call.event_id, TOOL_RESULT_DEPENDENCY)
     assert _has_edge(graph, llm_output.event_id, memory_write.event_id, STATE_DEPENDENCY)
-    assert _has_edge(graph, memory_write.event_id, final_output.event_id, STATE_DEPENDENCY)
+    assert _has_edge(graph, memory_write.event_id, memory_read.event_id, MEMORY_DEPENDENCY)
+    assert _has_edge(graph, memory_read.event_id, final_output.event_id, STATE_DEPENDENCY)
     assert _has_edge(graph, final_output.event_id, failure_label.event_id, STATE_DEPENDENCY)
 
 
@@ -116,7 +119,7 @@ def test_refund_demo_script_smoke(tmp_path):
     assert "Events:" in result.stdout
     assert "Graph Edges:" in result.stdout
     assert "tooloutput get_payment_history -> llmcall interpret_payment_history" in result.stdout
-    assert "memorywrite write_refund_status -> finaloutput final_answer" in result.stdout
+    assert "memoryread read_refund_status -> finaloutput final_answer" in result.stdout
 
 
 def _event(events, event_type, name):

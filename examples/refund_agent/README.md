@@ -11,7 +11,8 @@ The fake workflow intentionally fails:
 3. The demo reads `payment["refund_eligible"]` to preserve field-level provenance.
 4. A provenance-preserving prompt is passed into a decorated fake LLM.
 5. A decorated memory write stores the fake LLM's incorrect refund status.
-6. Manual `finaloutput` and `failurelabel` events close the trace.
+6. A decorated memory read retrieves the stored bad status.
+7. Manual `finaloutput` and `failurelabel` events close the trace.
 
 ## Run It
 
@@ -45,6 +46,7 @@ tooloutput get_payment_history
 llmcall interpret_payment_history
 llmoutput interpret_payment_history
 memorywrite write_refund_status
+memoryread read_refund_status
 finaloutput final_answer
 failurelabel evaluator_result
 ```
@@ -54,7 +56,8 @@ The graph should include these dependency edges:
 ```text
 tooloutput get_payment_history -> llmcall interpret_payment_history
 llmoutput interpret_payment_history -> memorywrite write_refund_status
-memorywrite write_refund_status -> finaloutput final_answer
+memorywrite write_refund_status -> memoryread read_refund_status
+memoryread read_refund_status -> finaloutput final_answer
 finaloutput final_answer -> failurelabel evaluator_result
 ```
 

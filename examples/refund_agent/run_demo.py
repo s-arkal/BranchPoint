@@ -43,6 +43,10 @@ def run_refund_workflow(bp: BranchPoint) -> str:
         store[key] = stored_status
         return {"key": key, "stored_status": stored_status}
 
+    @bp.memory_read("read_refund_status", exclude_args=[0])
+    def read_refund_status(store: dict[str, Any], key: str) -> dict[str, Any]:
+        return {"key": key, "stored_status": store[key]}
+
     with bp.trace("refund-workflow") as trace:
         bp.emit(
             type=USER_REQUEST,
@@ -64,7 +68,8 @@ def run_refund_workflow(bp: BranchPoint) -> str:
 
         interpretation = interpret_payment_history(prompt)
         refund_status = interpretation["refund_status"]
-        memory_result = write_refund_status(memory, "refund_status", refund_status)
+        write_refund_status(memory, "refund_status", refund_status)
+        memory_result = read_refund_status(memory, "refund_status")
 
         final_event = bp.emit(
             type=FINAL_OUTPUT,
